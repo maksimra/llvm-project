@@ -948,6 +948,39 @@ void RewriteInstance::discoverFileObjects() {
 
     return false;
   };
+
+  // A symbol version entry corresponds to a dynamic symbol by index. Match it
+  // back to a static symbol using both its raw name and address: an unrelated
+  // alias can have the same address and must retain its own name.
+  std::map<std::pair<std::string, uint64_t>, std::string> DynSymNames;
+  std::vector<VersionEntry> SymbolVersions =
+      cantFail(InputFile->readDynsymVersions(),
+               "failed to read dynamic symbol versions");
+  if (!SymbolVersions.empty()) {
+    size_t VersionIndex = 0;
+    for (const SymbolRef &Symbol : InputFile->getDynamicSymbolIterators()) {
+      assert(VersionIndex < SymbolVersions.size() &&
+             "missing dynamic symbol version entry");
+      const VersionEntry &Version = SymbolVersions[VersionIndex++];
+      if (Version.Name.empty())
+        continue;
+
+      Expected<StringRef> NameOrErr = Symbol.getName();
+      if (!NameOrErr) {
+        consumeError(NameOrErr.takeError());
+        continue;
+      }
+      const uint64_t Address = cantFail(Symbol.getAddress());
+      if (NameOrErr->empty() || !Address || !isSymbolInMemory(Symbol))
+        continue;
+
+      DynSymNames[{NameOrErr->str(), Address}] =
+          NameOrErr->str() + (Version.IsVerDef ? "@@" : "@") + Version.Name;
+    }
+    assert(VersionIndex == SymbolVersions.size() &&
+           "extra dynamic symbol version entries");
+  }
+
   for (const SymbolRef &Symbol : InputFile->symbols())
     if (isSymbolInMemory(Symbol)) {
       SymbolInfo SymInfo{cantFail(Symbol.getAddress()), Symbol};
@@ -1050,6 +1083,11 @@ void RewriteInstance::discoverFileObjects() {
       continue;
 
     StringRef SymName = cantFail(Symbol.getName(), "cannot get symbol name");
+    if (SymbolFlags & SymbolRef::SF_Global) {
+      auto DynSymName = DynSymNames.find({SymName.str(), SymbolAddress});
+      if (DynSymName != DynSymNames.end())
+        SymName = DynSymName->second;
+    }
     if (SymbolAddress == 0) {
       if (opts::Verbosity >= 1 && SymbolType == SymbolRef::ST_Function)
         BC->errs() << "BOLT-WARNING: function with 0 address seen\n";
@@ -1713,6 +1751,24 @@ void RewriteInstance::registerFragments() {
   // Process fragments with ambiguous parents separately as they are typically a
   // vanishing minority of cases and require expensive symbol table lookups.
   std::vector<std::pair<StringRef, BinaryFunction *>> AmbiguousFragments;
+  auto getVersionedParents = [&](StringRef ParentName,
+                                 BinaryFunction &Fragment) {
+    SmallVector<BinaryFunction *> Candidates;
+    for (auto &BFI : BC->getBinaryFunctions()) {
+      BinaryFunction &Candidate = BFI.second;
+      if (&Candidate == &Fragment)
+        continue;
+      for (StringRef Name : Candidate.getNames()) {
+        if (Name.consume_front(ParentName) && Name.starts_with("@")) {
+          if (!llvm::is_contained(Candidates, &Candidate))
+            Candidates.push_back(&Candidate);
+          break;
+        }
+      }
+    }
+    return Candidates;
+  };
+
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
     if (!Function.isFragment())
@@ -1727,6 +1783,24 @@ void RewriteInstance::registerFragments() {
       const BinaryData *BD = BC->getBinaryDataByName(ParentName);
       const uint64_t NumPossibleLocalParents =
           NR.getUniquifiedNameCount(ParentName);
+      if (!BD && !NumPossibleLocalParents) {
+        // A .symtab fragment can retain an unversioned name while its parent
+        // acquires a reconstructed dynsym version name. Do not turn the
+        // unversioned name into a global alias: it may identify more than one
+        // version, and the default version is not necessarily the parent.
+        SmallVector<BinaryFunction *> Candidates =
+            getVersionedParents(ParentName, Function);
+        if (Candidates.size() > 1) {
+          llvm::erase_if(Candidates, [&](BinaryFunction *Candidate) {
+            return !Candidate->hasDirectBranchTo(Function) &&
+                   !Function.hasDirectBranchTo(*Candidate);
+          });
+        }
+        if (Candidates.size() == 1) {
+          BC->registerFragment(Function, *Candidates.front());
+          continue;
+        }
+      }
       // The most common case: single local parent fragment.
       if (!BD && NumPossibleLocalParents == 1) {
         BD = BC->getBinaryDataByName(NR.getUniqueName(ParentName, 1));
