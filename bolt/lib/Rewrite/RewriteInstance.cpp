@@ -37,6 +37,7 @@
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/ADT/AddressRanges.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -1094,8 +1095,8 @@ void RewriteInstance::discoverFileObjects() {
   // Identify only global names that would otherwise trigger the conflicting
   // global-symbol error below. Identical entries at the same address and size
   // are harmless and retain their original name.
-  StringMap<std::pair<uint64_t, uint64_t>> GlobalSymbolIdentities;
-  StringSet<> ConflictingGlobalNames;
+  using SymbolIdentity = std::pair<uint64_t, uint64_t>;
+  StringMap<SmallVector<SymbolIdentity>> GlobalSymbolIdentities;
   for (auto Iter = SortedSymbols.begin(); Iter != SortedSymbolsEnd; ++Iter) {
     const SymbolRef &Symbol = Iter->Symbol;
     if (!(cantFail(Symbol.getFlags()) & SymbolRef::SF_Global) ||
@@ -1105,11 +1106,31 @@ void RewriteInstance::discoverFileObjects() {
     if (Name.empty() ||
         ((Name == "__hot_start" || Name == "__hot_end") && !opts::HeatmapMode))
       continue;
-    const std::pair<uint64_t, uint64_t> Identity{
-        Iter->Address, ELFSymbolRef(Symbol).getSize()};
-    auto [It, Inserted] = GlobalSymbolIdentities.try_emplace(Name, Identity);
-    if (!Inserted && It->second != Identity)
-      ConflictingGlobalNames.insert(Name);
+    const SymbolIdentity Identity{Iter->Address,
+                                  ELFSymbolRef(Symbol).getSize()};
+    SmallVector<SymbolIdentity> &Identities = GlobalSymbolIdentities[Name];
+    if (!llvm::is_contained(Identities, Identity))
+      Identities.push_back(Identity);
+  }
+
+  // Version-based disambiguation is safe only when every distinct identity
+  // for a conflicting raw name has matching dynamic version metadata. Two
+  // identities at one address cannot be distinguished by the available key.
+  StringSet<> ResolvableConflictingGlobalNames;
+  for (const auto &Entry : GlobalSymbolIdentities) {
+    ArrayRef<SymbolIdentity> Identities = Entry.getValue();
+    if (Identities.size() < 2)
+      continue;
+    SmallDenseSet<uint64_t, 4> Addresses;
+    const bool AllIdentitiesVersioned =
+        llvm::all_of(Identities, [&](const SymbolIdentity &Identity) {
+          if (!Addresses.insert(Identity.first).second)
+            return false;
+          auto It = DynSymNames.find({Entry.getKey().str(), Identity.first});
+          return It != DynSymNames.end() && !It->second.empty();
+        });
+    if (AllIdentitiesVersioned)
+      ResolvableConflictingGlobalNames.insert(Entry.getKey());
   }
 
   for (auto Iter = SortedSymbols.begin(); Iter != SortedSymbolsEnd; ++Iter) {
@@ -1126,7 +1147,7 @@ void RewriteInstance::discoverFileObjects() {
     ArrayRef<std::string> VersionedNames;
     bool HasVersionedName = false;
     if ((SymbolFlags & SymbolRef::SF_Global) &&
-        ConflictingGlobalNames.contains(SymName)) {
+        ResolvableConflictingGlobalNames.contains(SymName)) {
       auto DynSymName = DynSymNames.find({SymName.str(), SymbolAddress});
       if (DynSymName != DynSymNames.end() && !DynSymName->second.empty()) {
         VersionedNames = DynSymName->second;
