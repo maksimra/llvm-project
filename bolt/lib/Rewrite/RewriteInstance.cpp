@@ -38,6 +38,8 @@
 #include "bolt/Utils/Utils.h"
 #include "llvm/ADT/AddressRanges.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFDebugFrame.h"
@@ -952,13 +954,9 @@ void RewriteInstance::discoverFileObjects() {
   // A symbol version entry corresponds to a dynamic symbol by index. Match it
   // back to a static symbol using both its raw name and address: an unrelated
   // alias can have the same address and must retain its own name. Multiple
-  // versions can share both fields, so preserve and consume all names in
-  // dynamic-symbol order.
-  struct VersionedNames {
-    SmallVector<std::string> Names;
-    size_t Next{0};
-  };
-  std::map<std::pair<std::string, uint64_t>, VersionedNames> DynSymNames;
+  // versions can share both fields and are aliases of the same object.
+  std::map<std::pair<std::string, uint64_t>, SmallVector<std::string>>
+      DynSymNames;
   std::vector<VersionEntry> SymbolVersions =
       cantFail(InputFile->readDynsymVersions(),
                "failed to read dynamic symbol versions");
@@ -983,7 +981,7 @@ void RewriteInstance::discoverFileObjects() {
       // readDynsymVersions() currently stores the ELF default-version bit in
       // VersionEntry::IsVerDef.
       const bool IsDefault = Version.IsVerDef;
-      DynSymNames[{NameOrErr->str(), Address}].Names.push_back(
+      DynSymNames[{NameOrErr->str(), Address}].push_back(
           NameOrErr->str() + (IsDefault ? "@@" : "@") + Version.Name);
     }
     assert(VersionIndex == SymbolVersions.size() &&
@@ -1082,6 +1080,38 @@ void RewriteInstance::discoverFileObjects() {
 
   const auto SortedSymbolsEnd =
       LastSymbol == SortedSymbols.end() ? LastSymbol : std::next(LastSymbol);
+
+  auto isPLTSymbol = [&](const SymbolInfo &SymInfo) {
+    const SymbolRef::Type SymbolType = cantFail(SymInfo.Symbol.getType());
+    if (SymbolType != SymbolRef::ST_Debug &&
+        SymbolType != SymbolRef::ST_Function)
+      return false;
+    ErrorOr<BinarySection &> Section =
+        BC->getSectionForAddress(SymInfo.Address);
+    return Section && getPLTSectionInfo(Section->getName());
+  };
+
+  // Identify only global names that would otherwise trigger the conflicting
+  // global-symbol error below. Identical entries at the same address and size
+  // are harmless and retain their original name.
+  StringMap<std::pair<uint64_t, uint64_t>> GlobalSymbolIdentities;
+  StringSet<> ConflictingGlobalNames;
+  for (auto Iter = SortedSymbols.begin(); Iter != SortedSymbolsEnd; ++Iter) {
+    const SymbolRef &Symbol = Iter->Symbol;
+    if (!(cantFail(Symbol.getFlags()) & SymbolRef::SF_Global) ||
+        !Iter->Address || isPLTSymbol(*Iter))
+      continue;
+    StringRef Name = cantFail(Symbol.getName(), "cannot get symbol name");
+    if (Name.empty() ||
+        ((Name == "__hot_start" || Name == "__hot_end") && !opts::HeatmapMode))
+      continue;
+    const std::pair<uint64_t, uint64_t> Identity{
+        Iter->Address, ELFSymbolRef(Symbol).getSize()};
+    auto [It, Inserted] = GlobalSymbolIdentities.try_emplace(Name, Identity);
+    if (!Inserted && It->second != Identity)
+      ConflictingGlobalNames.insert(Name);
+  }
+
   for (auto Iter = SortedSymbols.begin(); Iter != SortedSymbolsEnd; ++Iter) {
     const SymbolRef &Symbol = Iter->Symbol;
     const uint64_t SymbolAddress = Iter->Address;
@@ -1093,12 +1123,14 @@ void RewriteInstance::discoverFileObjects() {
 
     StringRef SymName = cantFail(Symbol.getName(), "cannot get symbol name");
     const StringRef RawSymName = SymName;
+    ArrayRef<std::string> VersionedNames;
     bool HasVersionedName = false;
-    if (SymbolFlags & SymbolRef::SF_Global) {
+    if ((SymbolFlags & SymbolRef::SF_Global) &&
+        ConflictingGlobalNames.contains(SymName)) {
       auto DynSymName = DynSymNames.find({SymName.str(), SymbolAddress});
-      if (DynSymName != DynSymNames.end() &&
-          DynSymName->second.Next < DynSymName->second.Names.size()) {
-        SymName = DynSymName->second.Names[DynSymName->second.Next++];
+      if (DynSymName != DynSymNames.end() && !DynSymName->second.empty()) {
+        VersionedNames = DynSymName->second;
+        SymName = VersionedNames.front();
         HasVersionedName = true;
       }
     }
@@ -1118,13 +1150,8 @@ void RewriteInstance::discoverFileObjects() {
     // Skip symbols in PLT sections that will be registered by disassemblePLT().
     // ST_Debug covers section markers (lld/GNU ld), ST_Function covers
     // explicit stub symbols emitted by mold (e.g., malloc$plt).
-    if (SymbolType == SymbolRef::ST_Debug ||
-        SymbolType == SymbolRef::ST_Function) {
-      ErrorOr<BinarySection &> BSection =
-          BC->getSectionForAddress(SymbolAddress);
-      if (BSection && getPLTSectionInfo(BSection->getName()))
-        continue;
-    }
+    if (isPLTSymbol(*Iter))
+      continue;
 
     /// It is possible we are seeing a globalized local. LLVM might treat it as
     /// a local if it has a "private global" prefix, e.g. ".L". Thus we have to
@@ -1191,6 +1218,10 @@ void RewriteInstance::discoverFileObjects() {
       if (!AlternativeName.empty())
         BC->registerNameAtAddress(AlternativeName, SymbolAddress, FinalSize,
                                   SymbolAlignment, SymbolFlags);
+      if (HasVersionedName)
+        for (const std::string &VersionedName : VersionedNames.drop_front())
+          BC->registerNameAtAddress(VersionedName, SymbolAddress, FinalSize,
+                                    SymbolAlignment, SymbolFlags);
     };
 
     section_iterator Section =
@@ -1395,6 +1426,9 @@ void RewriteInstance::discoverFileObjects() {
 
     if (!AlternativeName.empty())
       BF->addAlternativeName(AlternativeName);
+    if (HasVersionedName)
+      for (const std::string &VersionedName : VersionedNames.drop_front())
+        BF->addAlternativeName(VersionedName);
 
     if (HasVersionedName && SymbolType == SymbolRef::ST_Function) {
       SmallVector<uint64_t> &Addresses =

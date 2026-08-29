@@ -9,9 +9,13 @@
 # RUN: ld.lld %t.o -o %t.so -shared --version-script %t.map
 # RUN: llvm-objdump -d %t.so | FileCheck %s --check-prefix=PLT
 # RUN: llvm-bolt %t.so -o %t.bolt -v=1 2>&1 | FileCheck %s
+# RUN: llvm-readelf --symbols %t.bolt | FileCheck %s --check-prefix=SYMS
 
 # PLT: <foo@plt>:
-# CHECK: BOLT-INFO: marking foo.cold as a fragment of foo_impl@@VERS_1
+# CHECK: BOLT-INFO: marking foo.cold as a fragment of foo
+# SYMS-LABEL: Symbol table '.symtab'
+# SYMS: foo
+# SYMS-NOT: foo@@VERS_1
 
 .text
 .globl foo_impl
