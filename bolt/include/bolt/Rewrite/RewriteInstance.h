@@ -486,6 +486,10 @@ private:
   std::unique_ptr<BinaryContext> BC;
   std::unique_ptr<CFIReaderWriter> CFIRdWrt;
 
+  /// Addresses of functions whose GNU versioned names were reconstructed from
+  /// dynamic symbol metadata, indexed by their original unversioned name.
+  std::map<std::string, SmallVector<uint64_t>> VersionedFunctionAddresses;
+
   // Run ExecutionEngine linker with custom memory manager and symbol resolver.
   std::unique_ptr<BOLTLinker> Linker;
 

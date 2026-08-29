@@ -1280,9 +1280,9 @@ BinaryFunction::disassembleInstructionAtOffset(uint64_t Offset) const {
   return std::nullopt;
 }
 
-bool BinaryFunction::hasDirectBranchTo(const BinaryFunction &Target) const {
-  assert(CurrentState == State::Empty &&
-         Target.getState() == State::Empty &&
+BinaryFunction::BranchScanResult BinaryFunction::hasDirectConditionalBranchTo(
+    const BinaryFunction &Target) const {
+  assert(CurrentState == State::Empty && Target.getState() == State::Empty &&
          "functions should not be disassembled");
 
   ErrorOr<ArrayRef<uint8_t>> FunctionData = getData();
@@ -1299,21 +1299,22 @@ bool BinaryFunction::hasDirectBranchTo(const BinaryFunction &Target) const {
     if (!BC.DisAsm->getInstruction(Instruction, Size,
                                    FunctionData->slice(Offset),
                                    InstructionAddress, nulls()))
-      return false;
+      return BranchScanResult::Unknown;
 
-    // Calls represent inter-function control flow and hence are not evidence
-    // that two symbol ranges are fragments of one function.
-    if (!BC.MIB->isBranch(Instruction) || BC.MIB->isCall(Instruction))
+    // An unconditional jump may be an inter-function tail call. A conditional
+    // branch from a parent into a cold fragment is useful positive evidence,
+    // but the absence of one does not disprove a fragment relationship.
+    if (!BC.MIB->isConditionalBranch(Instruction))
       continue;
 
     uint64_t TargetAddress;
     if (BC.MIB->evaluateBranch(Instruction, InstructionAddress, Size,
                                TargetAddress) &&
         Target.containsAddress(TargetAddress))
-      return true;
+      return BranchScanResult::Found;
   }
 
-  return false;
+  return BranchScanResult::NotFound;
 }
 
 uint64_t

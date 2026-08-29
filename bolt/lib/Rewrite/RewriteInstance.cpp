@@ -974,8 +974,11 @@ void RewriteInstance::discoverFileObjects() {
       if (NameOrErr->empty() || !Address || !isSymbolInMemory(Symbol))
         continue;
 
+      // readDynsymVersions() currently stores the ELF default-version bit in
+      // VersionEntry::IsVerDef.
+      const bool IsDefault = Version.IsVerDef;
       DynSymNames[{NameOrErr->str(), Address}] =
-          NameOrErr->str() + (Version.IsVerDef ? "@@" : "@") + Version.Name;
+          NameOrErr->str() + (IsDefault ? "@@" : "@") + Version.Name;
     }
     assert(VersionIndex == SymbolVersions.size() &&
            "extra dynamic symbol version entries");
@@ -1083,10 +1086,14 @@ void RewriteInstance::discoverFileObjects() {
       continue;
 
     StringRef SymName = cantFail(Symbol.getName(), "cannot get symbol name");
+    const StringRef RawSymName = SymName;
+    bool HasVersionedName = false;
     if (SymbolFlags & SymbolRef::SF_Global) {
       auto DynSymName = DynSymNames.find({SymName.str(), SymbolAddress});
-      if (DynSymName != DynSymNames.end())
+      if (DynSymName != DynSymNames.end()) {
         SymName = DynSymName->second;
+        HasVersionedName = true;
+      }
     }
     if (SymbolAddress == 0) {
       if (opts::Verbosity >= 1 && SymbolType == SymbolRef::ST_Function)
@@ -1381,6 +1388,13 @@ void RewriteInstance::discoverFileObjects() {
 
     if (!AlternativeName.empty())
       BF->addAlternativeName(AlternativeName);
+
+    if (HasVersionedName && SymbolType == SymbolRef::ST_Function) {
+      SmallVector<uint64_t> &Addresses =
+          VersionedFunctionAddresses[RawSymName.str()];
+      if (!llvm::is_contained(Addresses, SymbolAddress))
+        Addresses.push_back(SymbolAddress);
+    }
 
     registerName(SymbolSize);
     PreviousFunction = BF;
@@ -1754,17 +1768,15 @@ void RewriteInstance::registerFragments() {
   auto getVersionedParents = [&](StringRef ParentName,
                                  BinaryFunction &Fragment) {
     SmallVector<BinaryFunction *> Candidates;
-    for (auto &BFI : BC->getBinaryFunctions()) {
-      BinaryFunction &Candidate = BFI.second;
-      if (&Candidate == &Fragment)
+    auto VI = VersionedFunctionAddresses.find(ParentName.str());
+    if (VI == VersionedFunctionAddresses.end())
+      return Candidates;
+    for (uint64_t Address : VI->second) {
+      auto BFI = BC->getBinaryFunctions().find(Address);
+      if (BFI == BC->getBinaryFunctions().end() || &BFI->second == &Fragment)
         continue;
-      for (StringRef Name : Candidate.getNames()) {
-        if (Name.consume_front(ParentName) && Name.starts_with("@")) {
-          if (!llvm::is_contained(Candidates, &Candidate))
-            Candidates.push_back(&Candidate);
-          break;
-        }
-      }
+      if (!llvm::is_contained(Candidates, &BFI->second))
+        Candidates.push_back(&BFI->second);
     }
     return Candidates;
   };
@@ -1790,15 +1802,29 @@ void RewriteInstance::registerFragments() {
         // version, and the default version is not necessarily the parent.
         SmallVector<BinaryFunction *> Candidates =
             getVersionedParents(ParentName, Function);
-        if (Candidates.size() > 1) {
-          llvm::erase_if(Candidates, [&](BinaryFunction *Candidate) {
-            return !Candidate->hasDirectBranchTo(Function) &&
-                   !Function.hasDirectBranchTo(*Candidate);
-          });
-        }
         if (Candidates.size() == 1) {
           BC->registerFragment(Function, *Candidates.front());
           continue;
+        }
+        if (Candidates.size() > 1) {
+          SmallVector<BinaryFunction *> Matches;
+          for (BinaryFunction *Candidate : Candidates)
+            if (Candidate->hasDirectConditionalBranchTo(Function) ==
+                BinaryFunction::BranchScanResult::Found)
+              Matches.push_back(Candidate);
+          if (Matches.size() == 1) {
+            BC->registerFragment(Function, *Matches.front());
+            continue;
+          }
+
+          BC->errs() << "BOLT-ERROR: unable to determine parent for fragment "
+                     << Function << "; possible versioned parents: ";
+          llvm::interleaveComma(Candidates, BC->errs(),
+                                [&](const BinaryFunction *Candidate) {
+                                  BC->errs() << *Candidate;
+                                });
+          BC->errs() << '\n';
+          exit(1);
         }
       }
       // The most common case: single local parent fragment.

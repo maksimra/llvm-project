@@ -1066,10 +1066,14 @@ public:
 
   std::optional<MCInst> disassembleInstructionAtOffset(uint64_t Offset) const;
 
-  /// Return true if this function contains a direct non-call branch into
+  enum class BranchScanResult { Found, NotFound, Unknown };
+
+  /// Check whether this function contains a direct conditional branch into
   /// \p Target. This performs a read-only scan of the raw function contents
-  /// and is only valid before regular disassembly.
-  bool hasDirectBranchTo(const BinaryFunction &Target) const;
+  /// and is only valid before regular disassembly. Unconditional branches are
+  /// ignored since they may be inter-function tail calls.
+  BranchScanResult
+  hasDirectConditionalBranchTo(const BinaryFunction &Target) const;
 
   /// Given a starting point \p Offset and a number of bytes \p MinLength,
   /// returns the number of bytes \p MinLength + Tail such that the last
