@@ -7,8 +7,10 @@
 # RUN: llvm-mc -filetype=obj -triple x86_64-unknown-linux %s -o %t.o
 # RUN: echo 'VERS_1 { global: foo; foo_impl; };' > %t.map
 # RUN: ld.lld %t.o -o %t.so -shared --version-script %t.map
+# RUN: llvm-objdump -d %t.so | FileCheck %s --check-prefix=PLT
 # RUN: llvm-bolt %t.so -o %t.bolt -v=1 2>&1 | FileCheck %s
 
+# PLT: <foo@plt>:
 # CHECK: BOLT-INFO: marking foo.cold as a fragment of foo_impl@@VERS_1
 
 .text

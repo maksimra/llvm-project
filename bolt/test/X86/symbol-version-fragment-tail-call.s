@@ -1,5 +1,6 @@
-## An unconditional jump to a possible versioned parent can be a tail call and
-## must not be used as evidence for fragment ownership.
+## Direct branches between possible versioned parents and a fragment can be
+## tail calls and must not be used as evidence for fragment ownership. Cover
+## both an unconditional jump and a conditional branch to the fragment.
 
 # REQUIRES: system-linux
 
@@ -22,6 +23,8 @@ foo_v1:
 .globl foo_v2
 .type foo_v2, @function
 foo_v2:
+  test %eax, %eax
+  jne foo.cold
   ret
 .size foo_v2, .-foo_v2
 

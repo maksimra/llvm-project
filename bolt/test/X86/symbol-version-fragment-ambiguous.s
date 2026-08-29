@@ -1,5 +1,5 @@
-## Verify that GNU symbol versions disambiguate duplicate global symbols
-## without renaming unrelated aliases at the same addresses.
+## Multiple genuine versioned parents without explicit ownership metadata are
+## ambiguous and must be rejected rather than selected by version or order.
 
 # REQUIRES: system-linux
 
@@ -7,14 +7,10 @@
 # RUN: echo 'VERS_1 { global: foo; foo_v1; };' > %t.map
 # RUN: echo 'VERS_2 { global: foo; foo_v2; } VERS_1;' >> %t.map
 # RUN: ld.lld %t.o -o %t.so -shared -Bsymbolic --version-script %t.map
-# RUN: llvm-bolt %t.so -o %t.bolt -v=1 2>&1 | FileCheck %s
-# RUN: llvm-readelf --symbols %t.bolt | FileCheck %s --check-prefix=SYMS
+# RUN: not llvm-bolt %t.so -o %t.bolt 2>&1 | FileCheck %s
 
-# CHECK-NOT: global symbol "foo" is not unique
-# SYMS-DAG: foo_v1
-# SYMS-DAG: foo_v2
-# SYMS-DAG: foo@VERS_1
-# SYMS-DAG: foo@@VERS_2
+# CHECK: BOLT-ERROR: unable to determine parent for fragment foo.cold;
+# CHECK-SAME: possible versioned parents:
 
 .text
 .globl foo_v1
@@ -28,6 +24,13 @@ foo_v1:
 foo_v2:
   ret
 .size foo_v2, .-foo_v2
+
+.section .text.cold,"ax",@progbits
+.globl foo.cold
+.type foo.cold, @function
+foo.cold:
+  ret
+.size foo.cold, .-foo.cold
 
 .symver foo_v1, foo@VERS_1
 .symver foo_v2, foo@@VERS_2

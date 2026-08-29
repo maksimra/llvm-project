@@ -951,8 +951,14 @@ void RewriteInstance::discoverFileObjects() {
 
   // A symbol version entry corresponds to a dynamic symbol by index. Match it
   // back to a static symbol using both its raw name and address: an unrelated
-  // alias can have the same address and must retain its own name.
-  std::map<std::pair<std::string, uint64_t>, std::string> DynSymNames;
+  // alias can have the same address and must retain its own name. Multiple
+  // versions can share both fields, so preserve and consume all names in
+  // dynamic-symbol order.
+  struct VersionedNames {
+    SmallVector<std::string> Names;
+    size_t Next{0};
+  };
+  std::map<std::pair<std::string, uint64_t>, VersionedNames> DynSymNames;
   std::vector<VersionEntry> SymbolVersions =
       cantFail(InputFile->readDynsymVersions(),
                "failed to read dynamic symbol versions");
@@ -977,8 +983,8 @@ void RewriteInstance::discoverFileObjects() {
       // readDynsymVersions() currently stores the ELF default-version bit in
       // VersionEntry::IsVerDef.
       const bool IsDefault = Version.IsVerDef;
-      DynSymNames[{NameOrErr->str(), Address}] =
-          NameOrErr->str() + (IsDefault ? "@@" : "@") + Version.Name;
+      DynSymNames[{NameOrErr->str(), Address}].Names.push_back(
+          NameOrErr->str() + (IsDefault ? "@@" : "@") + Version.Name);
     }
     assert(VersionIndex == SymbolVersions.size() &&
            "extra dynamic symbol version entries");
@@ -1090,8 +1096,9 @@ void RewriteInstance::discoverFileObjects() {
     bool HasVersionedName = false;
     if (SymbolFlags & SymbolRef::SF_Global) {
       auto DynSymName = DynSymNames.find({SymName.str(), SymbolAddress});
-      if (DynSymName != DynSymNames.end()) {
-        SymName = DynSymName->second;
+      if (DynSymName != DynSymNames.end() &&
+          DynSymName->second.Next < DynSymName->second.Names.size()) {
+        SymName = DynSymName->second.Names[DynSymName->second.Next++];
         HasVersionedName = true;
       }
     }
@@ -1807,16 +1814,6 @@ void RewriteInstance::registerFragments() {
           continue;
         }
         if (Candidates.size() > 1) {
-          SmallVector<BinaryFunction *> Matches;
-          for (BinaryFunction *Candidate : Candidates)
-            if (Candidate->hasDirectConditionalBranchTo(Function) ==
-                BinaryFunction::BranchScanResult::Found)
-              Matches.push_back(Candidate);
-          if (Matches.size() == 1) {
-            BC->registerFragment(Function, *Matches.front());
-            continue;
-          }
-
           BC->errs() << "BOLT-ERROR: unable to determine parent for fragment "
                      << Function << "; possible versioned parents: ";
           llvm::interleaveComma(Candidates, BC->errs(),

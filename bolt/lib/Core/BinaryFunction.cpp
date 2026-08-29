@@ -1280,43 +1280,6 @@ BinaryFunction::disassembleInstructionAtOffset(uint64_t Offset) const {
   return std::nullopt;
 }
 
-BinaryFunction::BranchScanResult BinaryFunction::hasDirectConditionalBranchTo(
-    const BinaryFunction &Target) const {
-  assert(CurrentState == State::Empty && Target.getState() == State::Empty &&
-         "functions should not be disassembled");
-
-  ErrorOr<ArrayRef<uint8_t>> FunctionData = getData();
-  assert(FunctionData && "function data is not available");
-
-  for (uint64_t Offset = 0, Size = 0; Offset < getSize(); Offset += Size) {
-    if (const size_t DataSize = getSizeOfDataInCodeAt(Offset)) {
-      Size = DataSize;
-      continue;
-    }
-
-    MCInst Instruction;
-    const uint64_t InstructionAddress = getAddress() + Offset;
-    if (!BC.DisAsm->getInstruction(Instruction, Size,
-                                   FunctionData->slice(Offset),
-                                   InstructionAddress, nulls()))
-      return BranchScanResult::Unknown;
-
-    // An unconditional jump may be an inter-function tail call. A conditional
-    // branch from a parent into a cold fragment is useful positive evidence,
-    // but the absence of one does not disprove a fragment relationship.
-    if (!BC.MIB->isConditionalBranch(Instruction))
-      continue;
-
-    uint64_t TargetAddress;
-    if (BC.MIB->evaluateBranch(Instruction, InstructionAddress, Size,
-                               TargetAddress) &&
-        Target.containsAddress(TargetAddress))
-      return BranchScanResult::Found;
-  }
-
-  return BranchScanResult::NotFound;
-}
-
 uint64_t
 BinaryFunction::getInstructionSequenceLength(uint64_t Offset,
                                              uint64_t MinLength) const {
