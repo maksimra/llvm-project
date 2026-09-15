@@ -2513,6 +2513,19 @@ Error RewriteInstance::readSpecialSections() {
 }
 
 void RewriteInstance::adjustCommandLineOptions() {
+  if (opts::JITLinkBranch26Relaxation) {
+    if (!BC->isAArch64() || !BC->isELF() || !BC->HasRelocations) {
+      BC->errs() << "BOLT-ERROR: --jitlink-branch26-relaxation requires an "
+                    "AArch64 ELF binary in relocation mode\n";
+      exit(1);
+    }
+    if (opts::CompactCodeModel) {
+      BC->errs() << "BOLT-ERROR: --jitlink-branch26-relaxation cannot be "
+                    "combined with --compact-code-model\n";
+      exit(1);
+    }
+  }
+
   if (BC->isAArch64() && !BC->HasRelocations)
     BC->errs() << "BOLT-WARNING: non-relocation mode for AArch64 is not fully "
                   "supported\n";

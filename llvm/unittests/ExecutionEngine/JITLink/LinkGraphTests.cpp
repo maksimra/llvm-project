@@ -833,6 +833,58 @@ TEST(LinkGraphTest, SplitBlock) {
     EXPECT_EQ(B3.edges().begin()->getOffset(), 0U);
 }
 
+TEST(LinkGraphTest, SplitBlockPreservesLaterSymbolAddress) {
+  LinkGraph G("foo", std::make_shared<orc::SymbolStringPool>(),
+              Triple("x86_64-apple-darwin"), SubtargetFeatures(),
+              getGenericEdgeKindName);
+  auto &Sec =
+      G.createSection("__data", orc::MemProt::Read | orc::MemProt::Write);
+  auto &B =
+      G.createContentBlock(Sec, BlockContent, orc::ExecutorAddr(0x1000), 1, 0);
+  auto &S = G.addDefinedSymbol(B, 15, "S", 1, Linkage::Strong, Scope::Default,
+                               false, false);
+  const orc::ExecutorAddr OriginalAddress = S.getAddress();
+
+  auto Blocks = G.splitBlock(B, ArrayRef<int>({4, 8}));
+
+  ASSERT_EQ(Blocks.size(), 3U);
+  EXPECT_EQ(&S.getBlock(), Blocks[2]);
+  EXPECT_EQ(S.getOffset(), 7U);
+  EXPECT_EQ(S.getAddress(), OriginalAddress);
+}
+
+TEST(LinkGraphTest, SplitBlockBoundarySymbols) {
+  LinkGraph G("foo", std::make_shared<orc::SymbolStringPool>(),
+              Triple("x86_64-apple-darwin"), SubtargetFeatures(),
+              getGenericEdgeKindName);
+  auto &Sec =
+      G.createSection("__data", orc::MemProt::Read | orc::MemProt::Write);
+  auto &B =
+      G.createContentBlock(Sec, BlockContent, orc::ExecutorAddr(0x1000), 1, 0);
+  auto &EndsAtBoundary =
+      G.addDefinedSymbol(B, 2, "ends_at_boundary", 2, Linkage::Strong,
+                         Scope::Default, false, false);
+  auto &StartsAtBoundary =
+      G.addDefinedSymbol(B, 4, "starts_at_boundary", 1, Linkage::Strong,
+                         Scope::Default, false, false);
+  auto &AnonymousAtBoundary = G.addAnonymousSymbol(B, 8, 0, false, false);
+  auto &ZeroSizeAtEnd =
+      G.addDefinedSymbol(B, B.getSize(), "zero_size_at_end", 0, Linkage::Strong,
+                         Scope::Default, false, false);
+
+  auto Blocks = G.splitBlock(B, ArrayRef<int>({4, 8}));
+
+  ASSERT_EQ(Blocks.size(), 3U);
+  EXPECT_EQ(&EndsAtBoundary.getBlock(), Blocks[0]);
+  EXPECT_EQ(EndsAtBoundary.getSize(), 2U);
+  EXPECT_EQ(&StartsAtBoundary.getBlock(), Blocks[1]);
+  EXPECT_EQ(StartsAtBoundary.getOffset(), 0U);
+  EXPECT_EQ(&AnonymousAtBoundary.getBlock(), Blocks[2]);
+  EXPECT_EQ(AnonymousAtBoundary.getOffset(), 0U);
+  EXPECT_EQ(&ZeroSizeAtEnd.getBlock(), Blocks[2]);
+  EXPECT_EQ(ZeroSizeAtEnd.getOffset(), Blocks[2]->getSize());
+}
+
 TEST(LinkGraphTest, GraphAllocationMethods) {
   LinkGraph G("foo", std::make_shared<orc::SymbolStringPool>(),
               Triple("x86_64-apple-darwin"), SubtargetFeatures(),

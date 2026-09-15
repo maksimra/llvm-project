@@ -14,6 +14,8 @@
 # RUN: llvm-bolt %t.exe -o %t.bolt.8 --pad-funcs-before=_start:8
 # RUN: llvm-bolt %t.exe -o %t.bolt.4.4 --pad-funcs-before=_start:4 --pad-funcs=_start:4
 # RUN: llvm-bolt %t.exe -o %t.bolt.4.8 --pad-funcs-before=_start:4 --pad-funcs=_start:8
+# RUN: llvm-bolt %t.exe -o %t.bolt.jitlink --pad-funcs-before=_start:4 \
+# RUN:   --pad-funcs=_start:8 --jitlink-branch26-relaxation
 
 # RUN: not llvm-bolt %t.exe -o %t.bolt.1 --pad-funcs-before=_start:1 2>&1 | FileCheck --check-prefix=CHECK-BAD-ALIGN %s
 
@@ -24,6 +26,7 @@
 # RUN: llvm-objdump --section=.text --disassemble %t.bolt.8 | FileCheck --check-prefix=CHECK-8 %s
 # RUN: llvm-objdump --section=.text --disassemble %t.bolt.4.4 | FileCheck --check-prefix=CHECK-4-4 %s
 # RUN: llvm-objdump --section=.text --disassemble %t.bolt.4.8 | FileCheck --check-prefix=CHECK-4-8 %s
+# RUN: llvm-objdump --section=.text --disassemble %t.bolt.jitlink | FileCheck --check-prefix=CHECK-JITLINK %s
 
 # Trigger relocation mode in bolt.
 .reloc 0, R_AARCH64_NONE
@@ -34,6 +37,7 @@
 # CHECK-4: 0000000000400004 <_start>
 # CHECK-4-4: 0000000000400004 <_start>
 # CHECK-8: 0000000000400008 <_start>
+# CHECK-JITLINK: [[#%.16x,START:]] <_start>
 .globl _start
 _start:
     ret
@@ -43,6 +47,7 @@ _start:
 # CHECK-4-4: 000000000040000c <_subsequent>
 # CHECK-4-8: 0000000000400010 <_subsequent>
 # CHECK-8: 000000000040000c <_subsequent>
+# CHECK-JITLINK: [[#%.16x,START+0xc]] <_subsequent>
 .globl _subsequent
 _subsequent:
     ret

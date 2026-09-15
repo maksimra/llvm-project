@@ -17,6 +17,7 @@ add_llvm_library(LLVMBOLTRewrite
   BoltDiff.cpp
   DWARFRewriter.cpp
   ExecutableFileMemoryManager.cpp
+  JITLinkAArch64.cpp
   JITLinkLinker.cpp
   LinuxKernelRewriter.cpp
   MachORewriteInstance.cpp

@@ -92,6 +92,24 @@
 # RUN: FileCheck %s --check-prefix=CHECK-SYMS --input-file=%t.uot.markers
 # RUN: FileCheck %s --check-prefix=CHECK-NOUND --input-file=%t.uot.markers
 
+## Pessimistic Branch26 islands are also included before --use-old-text chooses
+## final addresses. The larger input text below leaves room for them.
+# RUN: llvm-bolt %t.exe -o %t.jit-uot --data %t.fdata --split-functions \
+# RUN:   --use-old-text --merge-text-sections --align-text=4 --lite=0 \
+# RUN:   --jitlink-branch26-relaxation --verify-branch26-range 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=CHECK-JIT-UOT
+# RUN: llvm-readelf -S %t.jit-uot \
+# RUN:   | FileCheck %s --check-prefix=CHECK-JIT-UOT-SECTIONS
+
+# CHECK-JIT-UOT-NOT: --use-old-text failed
+# CHECK-JIT-UOT: BOLT-INFO: using original .text for new code
+# CHECK-JIT-UOT: BOLT-INFO: JITLink Branch26 relaxation:
+# CHECK-JIT-UOT: BOLT-INFO: AArch64 Branch26PCRel edges:
+# CHECK-JIT-UOT-SAME: out-of-range=0
+# CHECK-JIT-UOT-SAME: old-text={{[1-9][0-9]*}}
+# CHECK-JIT-UOT-SECTIONS: ] .text {{.*}} AX
+# CHECK-JIT-UOT-SECTIONS-NOT: .bolt.jitlink
+
         .text
         .globl  _start
         .type   _start, %function
@@ -147,7 +165,7 @@ chain:
         .globl  filler
         .type   filler, %function
 filler:
-        .rept 32
+        .rept 128
         ret
         .endr
         .size filler, .-filler

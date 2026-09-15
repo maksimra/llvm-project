@@ -10,6 +10,8 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
+#include "bolt/Rewrite/JITLinkAArch64.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
@@ -58,16 +60,16 @@ void reassignSectionAddress(jitlink::LinkGraph &LG,
                             const BinarySection &BinSection, uint64_t Address) {
   auto *JLSection = LG.findSectionByName(BinSection.getSectionID());
   assert(JLSection && "cannot find section in LinkGraph");
+  assert(BinSection.getOutputSize() == JITLinkLinker::sectionSize(*JLSection) &&
+         "BinarySection size does not match LinkGraph allocation size");
 
-  auto BlockAddress = Address;
+  uint64_t BlockOffset = 0;
   for (auto *Block : JITLinkLinker::orderedBlocks(*JLSection)) {
-    // FIXME it would seem to make sense to align here. However, in
-    // non-relocation mode, we simply use the original address of functions
-    // which might not be aligned with the minimum alignment used by
-    // BinaryFunction (2). Example failing test when aligning:
-    // bolt/test/X86/addr32.s
-    Block->setAddress(orc::ExecutorAddr(BlockAddress));
-    BlockAddress += Block->getSize();
+    // Mirror the memory manager's packing. Address itself may be unaligned in
+    // non-relocation mode, so alignment applies to the section-relative offset.
+    BlockOffset = jitlink::alignToBlock(BlockOffset, *Block);
+    Block->setAddress(orc::ExecutorAddr(Address + BlockOffset));
+    BlockOffset += Block->getSize();
   }
 }
 
@@ -76,6 +78,7 @@ void reassignSectionAddress(jitlink::LinkGraph &LG,
 struct JITLinkLinker::Context : jitlink::JITLinkContext {
   JITLinkLinker &Linker;
   JITLinkLinker::SectionsMapper MapSections;
+  std::unique_ptr<AArch64JITLinkBranch26RelaxationPlan> Branch26Plan;
 
   Context(JITLinkLinker &Linker, JITLinkLinker::SectionsMapper MapSections)
       : JITLinkContext(&Linker.Dylib), Linker(Linker),
@@ -96,6 +99,16 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   Error modifyPassConfig(jitlink::LinkGraph &G,
                          jitlink::PassConfiguration &Config) override {
     Config.PrePrunePasses.push_back(markSectionsLive);
+    if (opts::JITLinkBranch26Relaxation && Linker.MM->ObjectsLoaded == 0) {
+      Branch26Plan =
+          std::make_unique<AArch64JITLinkBranch26RelaxationPlan>();
+      // This is the last phase where the executable layout may grow. All
+      // thunk storage must be present before allocation and MapSections.
+      Config.PostPrunePasses.push_back([this](auto &G) {
+        return prepareAArch64JITLinkBranch26Relaxation(Linker.BC, G,
+                                                       *Branch26Plan);
+      });
+    }
     Config.PostAllocationPasses.push_back([this](auto &G) {
       MapSections([&G](const BinarySection &Section, uint64_t Address) {
         reassignSectionAddress(G, Section, Address);
@@ -107,6 +120,17 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
       Config.PostAllocationPasses.push_back(
           jitlink::createRelaxationPass_ELF_riscv());
     }
+
+    if (Branch26Plan)
+      Config.PreFixupPasses.push_back([this](auto &) {
+        return relaxAArch64JITLinkBranch26(Linker.BC, *Branch26Plan);
+      });
+
+    if (shouldVerifyAArch64JITLinkBranch26Range() &&
+        G.getTargetTriple().isAArch64())
+      Config.PreFixupPasses.push_back([this](auto &G) {
+        return verifyAArch64JITLinkBranch26Range(Linker.BC, G);
+      });
 
     return Error::success();
   }

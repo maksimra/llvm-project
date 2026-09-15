@@ -18,6 +18,7 @@
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/DebugInfo/DWARF/DWARFCompileUnit.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
@@ -109,6 +110,7 @@ private:
 
   MCStreamer &Streamer;
   BinaryContext &BC;
+  DenseMap<const MCSymbol *, MCSymbol *> JITLinkBranch26Aliases;
 
 public:
   BinaryEmitter(MCStreamer &Streamer, BinaryContext &BC)
@@ -125,6 +127,12 @@ public:
 private:
   /// Emit function code.
   void emitFunctions();
+
+  bool emitJITLinkCodeMarker(const BinaryFunction &BF) const;
+  bool isJITLinkBranch26(const MCInst &Inst) const;
+  void prepareJITLinkBranch26Aliases();
+  void emitLabelWithJITLinkAlias(MCSymbol *Symbol);
+  void emitInstructionWithJITLinkAlias(const MCInst &Inst);
 
   /// Emit a single function.
   bool emitFunction(BinaryFunction &BF, FunctionFragment &FF);
@@ -183,6 +191,91 @@ private:
 
 } // anonymous namespace
 
+bool BinaryEmitter::emitJITLinkCodeMarker(const BinaryFunction &BF) const {
+  return opts::JITLinkBranch26Relaxation && BC.isAArch64() && BC.isELF() &&
+         BC.HasRelocations && !BF.isPatch();
+}
+
+bool BinaryEmitter::isJITLinkBranch26(const MCInst &Inst) const {
+  return !BC.MIB->isIndirectBranch(Inst) && !BC.MIB->isIndirectCall(Inst) &&
+         (BC.MIB->isBranch(Inst) || BC.MIB->isCall(Inst)) &&
+         BC.MIB->getPCRelEncodingSize(Inst) ==
+             BC.MIB->getUncondBranchEncodingSize();
+}
+
+void BinaryEmitter::prepareJITLinkBranch26Aliases() {
+  if (!opts::JITLinkBranch26Relaxation || !BC.isAArch64() || !BC.isELF() ||
+      !BC.HasRelocations)
+    return;
+
+  uint64_t AliasNumber = 0;
+  for (BinaryFunction *BF : BC.getOutputBinaryFunctions()) {
+    if (!BC.shouldEmit(*BF) || BF->isPatch())
+      continue;
+    for (BinaryBasicBlock &BB : *BF) {
+      for (const MCInst &Inst : BB) {
+        if (!isJITLinkBranch26(Inst))
+          continue;
+        const MCSymbol *Target = BC.MIB->getTargetSymbol(Inst);
+        BinaryFunction *TargetFunction =
+            Target ? BC.getFunctionForSymbol(Target) : nullptr;
+        if (!TargetFunction || !BC.shouldEmit(*TargetFunction) ||
+            TargetFunction->isPatch())
+          continue;
+        if (JITLinkBranch26Aliases.contains(Target))
+          continue;
+        // A linker-private symbol has a collision-proof MCContext identity
+        // and is non-temporary, which permits making it global below. Global
+        // binding prevents the assembler from resolving a same-section branch
+        // before JITLink can inspect it.
+        MCSymbol *Alias = BC.Ctx->createLinkerPrivateSymbol(formatv(
+            "__BOLT_jitlink_branch26_target_{0}_{1}_{2}_", AliasNumber++,
+            Target->getName().size(), Target->getName()));
+        JITLinkBranch26Aliases.try_emplace(Target, Alias);
+      }
+    }
+  }
+}
+
+void BinaryEmitter::emitLabelWithJITLinkAlias(MCSymbol *Symbol) {
+  Streamer.emitLabel(Symbol);
+  auto It = JITLinkBranch26Aliases.find(Symbol);
+  if (It == JITLinkBranch26Aliases.end())
+    return;
+  Streamer.emitSymbolAttribute(It->second, MCSA_Global);
+  Streamer.emitLabel(It->second);
+}
+
+void BinaryEmitter::emitInstructionWithJITLinkAlias(const MCInst &Inst) {
+  if (JITLinkBranch26Aliases.empty() || !isJITLinkBranch26(Inst)) {
+    Streamer.emitInstruction(Inst, *BC.STI);
+    return;
+  }
+  const MCSymbol *Target = BC.MIB->getTargetSymbol(Inst);
+  auto It = JITLinkBranch26Aliases.find(Target);
+  if (It == JITLinkBranch26Aliases.end()) {
+    Streamer.emitInstruction(Inst, *BC.STI);
+    return;
+  }
+
+  MCInst AliasedInst = Inst;
+  BC.MIB->replaceBranchTarget(AliasedInst, It->second, BC.Ctx.get());
+  const int64_t Addend = BC.MIB->getTargetAddend(Inst);
+  if (Addend) {
+    for (MCOperand &Operand : AliasedInst) {
+      if (!Operand.isExpr() ||
+          BC.MIB->getTargetSymbol(Operand.getExpr()) != It->second)
+        continue;
+      const MCExpr *Expr = MCBinaryExpr::createAdd(
+          MCSymbolRefExpr::create(It->second, *BC.Ctx),
+          MCConstantExpr::create(Addend, *BC.Ctx), *BC.Ctx);
+      Operand = MCOperand::createExpr(Expr);
+      break;
+    }
+  }
+  Streamer.emitInstruction(AliasedInst, *BC.STI);
+}
+
 void BinaryEmitter::emitAll(StringRef OrgSecPrefix) {
   Streamer.initSections(*BC.STI);
   Streamer.setUseAssemblerInfoForParsing(false);
@@ -222,6 +315,8 @@ void BinaryEmitter::emitAll(StringRef OrgSecPrefix) {
 }
 
 void BinaryEmitter::emitFunctions() {
+  prepareJITLinkBranch26Aliases();
+
   auto emit = [&](const BinaryFunctionListType &Functions) {
     const bool HasProfile = BC.NumProfiledFuncs > 0;
     const bool OriginalAllowAutoPadding = Streamer.getAllowAutoPadding();
@@ -297,11 +392,19 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   if (!BC.HasRelocations && !Function.hasNonPseudoInstructions())
     return false;
 
-  MCSection *Section =
-      BC.getCodeSection(Function.getCodeSectionName(FF.getFragmentNum()));
+  const FragmentNum Fragment = FF.getFragmentNum();
+  MCSection *Section = BC.getCodeSection(Function.getCodeSectionName(Fragment));
   Streamer.switchSection(Section);
   Section->setHasInstructions(true);
   BC.Ctx->addGenDwarfSection(Section);
+
+  if (emitJITLinkCodeMarker(Function)) {
+    const bool Added = Function.addJITLinkCodeFragment(Fragment);
+    assert(Added && "function fragment emitted more than once");
+    (void)Added;
+    Streamer.emitLabel(
+        BC.Ctx->getOrCreateSymbol(Function.getJITLinkCodeStartName(Fragment)));
+  }
 
   if (BC.HasRelocations) {
     // Set section alignment to at least maximum possible object alignment.
@@ -353,11 +456,11 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   if (FF.isMainFragment()) {
     for (MCSymbol *Symbol : Function.getSymbols()) {
       Streamer.emitSymbolAttribute(Symbol, MCSA_ELF_TypeFunction);
-      Streamer.emitLabel(Symbol);
+      emitLabelWithJITLinkAlias(Symbol);
     }
   } else {
     Streamer.emitSymbolAttribute(StartSymbol, MCSA_ELF_TypeFunction);
-    Streamer.emitLabel(StartSymbol);
+    emitLabelWithJITLinkAlias(StartSymbol);
   }
 
   const bool NeedsFDE =
@@ -451,10 +554,10 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         BB->getAlignment() > 1)
       Streamer.emitCodeAlignment(BB->getAlign(), *BC.STI,
                                  BB->getAlignmentMaxBytes());
-    Streamer.emitLabel(BB->getLabel());
+    emitLabelWithJITLinkAlias(BB->getLabel());
     if (!EmitCodeOnly) {
       if (MCSymbol *EntrySymbol = BF.getSecondaryEntryPointSymbol(*BB))
-        Streamer.emitLabel(EntrySymbol);
+        emitLabelWithJITLinkAlias(EntrySymbol);
     }
 
     SMLoc LastLocSeen;
@@ -507,7 +610,7 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         }
       }
 
-      Streamer.emitInstruction(Instr, *BC.STI);
+      emitInstructionWithJITLinkAlias(Instr);
     }
   }
 

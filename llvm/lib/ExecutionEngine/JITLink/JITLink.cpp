@@ -216,8 +216,9 @@ std::vector<Block *> LinkGraph::splitBlockImpl(std::vector<Block *> Blocks,
     }
 
     auto TransferSymbol = [](Symbol &Sym, Block &B) {
-      Sym.setOffset(Sym.getAddress() - B.getAddress());
+      orc::ExecutorAddr Addr = Sym.getAddress();
       Sym.setBlock(B);
+      Sym.setOffset(Addr - B.getAddress());
       if (Sym.getSize() > B.getSize())
         Sym.setSize(B.getSize() - Sym.getOffset());
     };

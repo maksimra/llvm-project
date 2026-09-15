@@ -13,7 +13,14 @@
 # RUN: llvm-bolt %t.exe -o %t.bolt --relax-exp --hot-functions-at-end --lite=0 \
 # RUN:   --data %t.fdata | FileCheck %s --check-prefix=CHECK-BOLT-HOT-END
 # RUN: llvm-objdump -d %t.bolt | FileCheck %s --check-prefix=CHECK-OUTPUT
-
+## The JITLink path sees the complete semantic representation, reserves
+## post-batch thunk groups before allocation, and relaxes only the four calls
+## that are actually out of range after final mapping.
+# RUN: llvm-bolt %t.exe -o %t.jitlink --jitlink-branch26-relaxation \
+# RUN:   --lite=0 --data %t.fdata --verify-branch26-range 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=CHECK-JITLINK
+# RUN: llvm-objdump -d --show-all-symbols %t.jitlink \
+# RUN:   | FileCheck %s --check-prefix=CHECK-JITLINK-OUTPUT
 ## Constant islands at the end of functions foo(), bar(), and _start() make each
 ## one of them ~112MB in size. Thus the total code size exceeds 300MB.
 
@@ -60,6 +67,20 @@ hot:
 
 # CHECK-BOLT-HOT-END: BOLT-INFO: 4 short thunks created
 # CHECK-BOLT-HOT-END: BOLT-INFO: 2 long thunks created
+
+# CHECK-JITLINK-NOT: __AArch64Thunk_
+# CHECK-JITLINK-NOT: __AArch64ADRPThunk_
+# CHECK-JITLINK: BOLT-INFO: JITLink Branch26 relaxation: batches=4, groups=4, reserved=10, used=4, direct=6, relaxed=4
+# CHECK-JITLINK: BOLT-INFO: AArch64 Branch26PCRel edges: total=10, out-of-range=0, CALL26=10, JUMP26=0
+
+## The third call in hot is redirected forward to its post-batch thunk. Its
+## ADRP+ADD+BR sequence transfers to _start without modifying LR.
+# CHECK-JITLINK-OUTPUT-LABEL: Disassembly of section .text:
+# CHECK-JITLINK-OUTPUT-LABEL: <hot>:
+# CHECK-JITLINK-OUTPUT:      bl [[THUNK:0x[0-9a-f]+]] <hot+0x38>
+# CHECK-JITLINK-OUTPUT:      {{[0-9a-f]+}}: {{[0-9a-f]+}}      adrp x16,
+# CHECK-JITLINK-OUTPUT-NEXT: {{[0-9a-f]+}}: {{[0-9a-f]+}}      add x16, x16,
+# CHECK-JITLINK-OUTPUT-NEXT: {{[0-9a-f]+}}: d61f0200      br x16
 
 ## Check that correct veneers are used depending on the target proximity.
 # CHECK-OUTPUT-LABEL: <hot>:

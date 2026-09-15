@@ -642,6 +642,9 @@ private:
   /// Symbol at the end of each fragment of a split function.
   mutable SmallVector<MCSymbol *, 0> FunctionEndLabels;
 
+  /// Fragments marked for recovery as semantic JITLink blocks after emission.
+  SmallVector<FragmentNum, 0> JITLinkCodeFragments;
+
   /// Unique number associated with the function.
   uint64_t FunctionNumber;
 
@@ -1423,6 +1426,26 @@ public:
     if (BC.HasWarmSection && Fragment == FragmentNum::warm())
       return SmallString<32>(BC.getWarmCodeSectionName());
     return formatv("{0}.{1}", getColdSectionName(), Fragment.get() - 1);
+  }
+
+  /// Return the private marker placed before this fragment's emitted bytes.
+  /// JITLink uses it to recover function/fragment block boundaries from the
+  /// fully laid out object section.
+  std::string getJITLinkCodeStartName(const FragmentNum Fragment) const {
+    return formatv("__BOLT_jitlink_start_{0}_{1}", getFunctionNumber(),
+                   Fragment.get())
+        .str();
+  }
+
+  bool addJITLinkCodeFragment(FragmentNum Fragment) {
+    if (llvm::is_contained(JITLinkCodeFragments, Fragment))
+      return false;
+    JITLinkCodeFragments.push_back(Fragment);
+    return true;
+  }
+
+  ArrayRef<FragmentNum> getJITLinkCodeFragments() const {
+    return JITLinkCodeFragments;
   }
 
   /// Assign a code section name to the function.

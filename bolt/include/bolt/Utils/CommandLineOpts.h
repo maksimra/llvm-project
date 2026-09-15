@@ -90,6 +90,7 @@ extern llvm::cl::opt<bool> AggregateOnly;
 extern llvm::cl::opt<bool> ArmSPE;
 extern llvm::cl::opt<unsigned> BucketsPerLine;
 extern llvm::cl::opt<bool> CompactCodeModel;
+extern llvm::cl::opt<bool> JITLinkBranch26Relaxation;
 extern llvm::cl::opt<bool> DiffOnly;
 extern llvm::cl::opt<bool> EnableBAT;
 extern llvm::cl::opt<bool> EqualizeBBCounts;

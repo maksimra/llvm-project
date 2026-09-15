@@ -15,6 +15,7 @@
 #include "bolt/Passes/BranchLivenessUtils.h"
 #include "bolt/Passes/RegAnalysis.h"
 #include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -84,7 +85,7 @@ static BinaryBasicBlock *getBBAtHotColdSplitPoint(BinaryFunction &Func) {
 
 static bool mayNeedStub(const BinaryContext &BC, const MCInst &Inst) {
   if (BC.isAArch64() && BC.MIB->isShortRangeBranch(Inst) &&
-      !opts::CompactCodeModel) {
+      !opts::CompactCodeModel && !opts::JITLinkBranch26Relaxation) {
     BC.errs() << "BOLT-ERROR: short range branch not supported"
               << " outside compact code model\n";
     BC.printInstruction(BC.errs(), Inst);
@@ -929,7 +930,8 @@ bool LongJmpPass::relaxLocalBranches(BinaryFunction &BF,
           const size_t BitsAvailable = MIB->getPCRelEncodingSize(Inst);
 
           // Span of +/-128MB.
-          if (BitsAvailable == LongestJumpBits)
+          if (BitsAvailable ==
+              static_cast<size_t>(BC.MIB->getUncondBranchEncodingSize()))
             continue;
 
           const MCSymbol *TargetSymbol = MIB->getTargetSymbol(Inst);
@@ -1321,7 +1323,54 @@ void LongJmpPass::relaxCalls(BinaryContext &BC) {
   BC.updateOutputBinaryFunctions(std::move(OutputFunctions));
 }
 
+static void prepareJITLinkBranch26TargetsForBTI(BinaryContext &BC) {
+  if (!BC.usesBTI())
+    return;
+
+  // Thunk selection happens after allocation, so conservatively prepare every
+  // non-local Branch26 target for the BR x16 used by a possible veneer.
+  SmallPtrSet<const MCSymbol *, 16> PatchedTargets;
+  for (BinaryFunction *BF : BC.getOutputBinaryFunctions()) {
+    if (!BC.shouldEmit(*BF) || BF->isPatch())
+      continue;
+
+    for (BinaryBasicBlock &BB : *BF) {
+      for (MCInst &Inst : BB) {
+        if (BC.MIB->isIndirectBranch(Inst) || BC.MIB->isIndirectCall(Inst) ||
+            (!BC.MIB->isBranch(Inst) && !BC.MIB->isCall(Inst)) ||
+            BC.MIB->getPCRelEncodingSize(Inst) !=
+                BC.MIB->getUncondBranchEncodingSize())
+          continue;
+
+        const MCSymbol *TargetSymbol = BC.MIB->getTargetSymbol(Inst);
+        if (!TargetSymbol)
+          continue;
+        BinaryFunction *TargetFunction =
+            BC.getFunctionForSymbol(TargetSymbol);
+        BinaryBasicBlock *TargetBB = nullptr;
+        if (TargetFunction)
+          TargetBB = TargetFunction->getBasicBlockForLabel(TargetSymbol);
+        if (TargetFunction == BF && TargetBB &&
+            TargetBB->getFragmentNum() == BB.getFragmentNum())
+          continue;
+        if (!PatchedTargets.insert(TargetSymbol).second)
+          continue;
+
+        // createLongJmp supplies the same final BR x16 as the JITLink thunk.
+        InstructionListType Thunk;
+        BC.MIB->createLongJmp(Thunk, TargetSymbol, BC.Ctx.get());
+        BC.MIB->applyBTIFixupCommon(TargetSymbol, TargetFunction, TargetBB,
+                                    Thunk.back());
+      }
+    }
+  }
+}
+
 Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
+
+  if (opts::JITLinkBranch26Relaxation && opts::ExperimentalRelaxation)
+    return createFatalBOLTError(
+        "--jitlink-branch26-relaxation cannot be combined with --relax-exp");
 
   assert((opts::CompactCodeModel || opts::ExperimentalRelaxation ||
           opts::SplitStrategy != opts::SplitFunctionsStrategy::CDSplit) &&
@@ -1348,9 +1397,15 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
     return It == BranchLiveness.end() ? nullptr : &It->second;
   };
 
-  if (opts::CompactCodeModel || opts::ExperimentalRelaxation) {
-    BC.outs()
-        << "BOLT-INFO: relaxing branches for compact code model (<128MB)\n";
+  if (opts::CompactCodeModel || opts::ExperimentalRelaxation ||
+      opts::JITLinkBranch26Relaxation) {
+    BC.outs() << (opts::JITLinkBranch26Relaxation
+                      ? "BOLT-INFO: relaxing CFG-local AArch64 branches\n"
+                      : "BOLT-INFO: relaxing branches for compact code model "
+                        "(<128MB)\n");
+
+    if (opts::JITLinkBranch26Relaxation)
+      prepareJITLinkBranch26TargetsForBTI(BC);
 
     std::atomic<bool> HasFatal{false};
     ParallelUtilities::WorkFuncTy WorkFun = [&](BinaryFunction &BF) {
@@ -1370,6 +1425,12 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
     // The error has already been reported by relaxLocalBranches().
     if (HasFatal)
       return createFatalBOLTError("branch relaxation failure");
+
+    if (opts::JITLinkBranch26Relaxation) {
+      BC.outs() << "BOLT-INFO: delegating AArch64 Branch26 range extension "
+                   "to JITLink\n";
+      return Error::success();
+    }
 
     if (!opts::ExperimentalRelaxation)
       return Error::success();

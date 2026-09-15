@@ -8,6 +8,14 @@
 # RUN: link_fdata --no-lbr %s %t %t.fdata
 # RUN: llvm-bolt %t -o %t.bolt --data %t.fdata -split-functions \
 # RUN: --print-only foo --print-split --print-all 2>&1 | FileCheck %s
+# RUN: llvm-bolt %t -o %t.jitlink --data %t.fdata -split-functions --lite=0 \
+# RUN:   --jitlink-branch26-relaxation --verify-branch26-range 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=CHECK-JITLINK
+
+# CHECK-JITLINK: BOLT-INFO: rewritten pac-ret DWARF info in 1 out of 1 functions
+# CHECK-JITLINK: BOLT-INFO: JITLink Branch26 relaxation:
+# CHECK-JITLINK: BOLT-INFO: AArch64 Branch26PCRel edges:
+# CHECK-JITLINK-SAME: total={{[1-9][0-9]*}}, out-of-range=0
 
 # Checking that we don't see any OpNegateRAState CFIs before the insertion pass.
 # CHECK-NOT: OpNegateRAState

@@ -26,4 +26,5 @@ CHECK-RETPOLINE: BOLT-ERROR: retpoline-insertion is specific to X86
 CHECK-STOKE: BOLT-ERROR: stoke-get-stat is specific to X86
 
 RUN: not llvm-bolt %t -o %t.bolt split-functions --split-strategy=cdsplit 2>&1 | FileCheck %s --check-prefix=CHECK-CDSPLIT
+RUN: not llvm-bolt %t -o %t.bolt --split-functions --split-strategy=cdsplit --jitlink-branch26-relaxation 2>&1 | FileCheck %s --check-prefix=CHECK-CDSPLIT
 CHECK-CDSPLIT: BOLT-ERROR: CDSplit is not supported with LongJmp. Try with '--compact-code-model'

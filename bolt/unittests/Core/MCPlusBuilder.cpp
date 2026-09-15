@@ -120,6 +120,24 @@ TEST_P(MCPlusBuilderTester, AliasSmallerX0) {
                  /*OnlySmaller=*/true);
 }
 
+TEST_P(MCPlusBuilderTester, AArch64_ReplaceBranchTargetDropsAddend) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+
+  MCSymbol *Target = BC->Ctx->getOrCreateSymbol("target");
+  MCSymbol *Replacement = BC->Ctx->getOrCreateSymbol("replacement");
+  const MCExpr *TargetWithAddend = MCBinaryExpr::createAdd(
+      MCSymbolRefExpr::create(Target, *BC->Ctx),
+      MCConstantExpr::create(-4, *BC->Ctx), *BC->Ctx);
+  MCInst Inst = MCInstBuilder(AArch64::BL).addExpr(TargetWithAddend);
+
+  EXPECT_EQ(BC->MIB->getTargetSymbol(Inst), Target);
+  EXPECT_EQ(BC->MIB->getTargetAddend(Inst), -4);
+  BC->MIB->replaceBranchTarget(Inst, Replacement, BC->Ctx.get());
+  EXPECT_EQ(BC->MIB->getTargetSymbol(Inst), Replacement);
+  EXPECT_EQ(BC->MIB->getTargetAddend(Inst), 0);
+}
+
 TEST_P(MCPlusBuilderTester, AArch64_createLoadImmediate) {
   if (GetParam() != Triple::aarch64)
     GTEST_SKIP();
