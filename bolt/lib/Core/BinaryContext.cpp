@@ -166,7 +166,6 @@ BinaryContext::BinaryContext(std::unique_ptr<MCContext> Ctx,
                              JournalingStreams Logger)
     : Ctx(std::move(Ctx)), DwCtx(std::move(DwCtx)),
       TheTriple(std::move(TheTriple)),
-      RelocHandler(createRelocationHandler(this->TheTriple->getArch())),
       SSP(std::move(SSP)), TheTarget(TheTarget), TripleName(TripleName),
       MCE(std::move(MCE)), MOFI(std::move(MOFI)), AsmInfo(std::move(AsmInfo)),
       MII(std::move(MII)), STI(std::move(STI)),
