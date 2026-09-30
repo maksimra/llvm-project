@@ -10,6 +10,8 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
+#include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/ExecutionEngine/JITLink/aarch64.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
@@ -107,6 +109,47 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
       Config.PostAllocationPasses.push_back(
           jitlink::createRelaxationPass_ELF_riscv());
     }
+
+    if (opts::VerifyBranch26Range && G.getTargetTriple().isAArch64())
+      Config.PreFixupPasses.push_back([this](auto &G) { // TODO: зачем тут лямбда выражение захватывает this?
+        return verifyAArch64Branch26Range(Linker.BC, G);
+      });
+
+    return Error::success();
+  }
+
+  Error verifyAArch64Branch26Range(BinaryContext &BC,
+                                   jitlink::LinkGraph &G) {
+    uint64_t Total = 0;
+    uint64_t OutOfRange = 0;
+    for (jitlink::Section &Section : G.sections()) {
+      for (jitlink::Block *Block : Section.blocks()) {
+        for (const jitlink::Edge &Edge : Block->edges()) {
+          if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
+            continue;
+
+          ++Total;
+          int64_t Displacement = Edge.getTarget().getAddress() -
+                                 Block->getFixupAddress(Edge) +
+                                 Edge.getAddend();
+          if (!isIntN(BC.MIB->getUncondBranchEncodingSize(), Displacement)) {
+            ++OutOfRange;
+            outs() << "BOLT-WARNING: branch is out of range\n"
+                   << "edge at 0x"
+                   << Twine::utohexstr(Block->getFixupAddress(Edge).getValue())
+                   << " in " << Section.getName() << " targets 0x"
+                   << Twine::utohexstr(Edge.getTarget().getAddress().getValue())
+                   << " and addend is "
+                   << Twine::utohexstr(Edge.getAddend()) << "\n";
+          }
+        }
+      }
+    }
+
+    outs() << "BOLT-INFO: " << Total << " branches detected before"
+              "fixups.\n";
+    outs() << "BOLT-INFO: " << OutOfRange << " branch destinations are "
+              "unreachable.\n";
 
     return Error::success();
   }
