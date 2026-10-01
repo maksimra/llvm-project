@@ -17,6 +17,7 @@
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Endian.h"
 
 #define DEBUG_TYPE "bolt"
 
@@ -79,6 +80,13 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   JITLinkLinker &Linker;
   JITLinkLinker::SectionsMapper MapSections;
 
+  struct StubRecord {
+    jitlink::Block *SourceBlock;
+    jitlink::Edge::OffsetT SourceOffset;
+    jitlink::Symbol *SlotSym;
+  };
+  std::vector<StubRecord> StubRecords;
+
   Context(JITLinkLinker &Linker, JITLinkLinker::SectionsMapper MapSections)
       : JITLinkContext(&Linker.Dylib), Linker(Linker),
         MapSections(MapSections) {}
@@ -98,6 +106,15 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   Error modifyPassConfig(jitlink::LinkGraph &G,
                          jitlink::PassConfiguration &Config) override {
     Config.PrePrunePasses.push_back(markSectionsLive);
+
+    if (opts::DoNotUseStubs && G.getTargetTriple().isAArch64()) {
+      Config.PostPrunePasses.push_back([this](auto &G) {
+        return addThunkSpace(G); });
+
+      Config.PreFixupPasses.push_back([this](auto &G) {
+        return repairEdges(G); });
+    }
+
     Config.PostAllocationPasses.push_back([this](auto &G) {
       MapSections([&G](const BinarySection &Section, uint64_t Address) {
         reassignSectionAddress(G, Section, Address);
@@ -110,10 +127,70 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
           jitlink::createRelaxationPass_ELF_riscv());
     }
 
-    if (opts::VerifyBranch26Range && G.getTargetTriple().isAArch64())
-      Config.PreFixupPasses.push_back([this](auto &G) { // TODO: зачем тут лямбда выражение захватывает this?
+    if (opts::VerifyBranch26Range && G.getTargetTriple().isAArch64()) {
+      Config.PreFixupPasses.push_back([this](auto &G) {
         return verifyAArch64Branch26Range(Linker.BC, G);
       });
+    }
+
+    return Error::success();
+  }
+
+  Error repairEdges(jitlink::LinkGraph &G) {
+    for (auto &Record : StubRecords) {
+      for (jitlink::Edge &Edge :
+           Record.SourceBlock->edges_at(Record.SourceOffset)) {
+        if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
+          continue;
+
+          orc::ExecutorAddr sourceAddress = Record.SourceBlock->getFixupAddress(Edge);
+          orc::ExecutorAddr targetAddress = Edge.getTarget().getAddress() + Edge.getAddend();
+          orc::ExecutorAddr slotAddress = Record.SlotSym->getAddress();
+
+          int64_t primaryDisplacement = targetAddress - sourceAddress;
+          int64_t slotDisplacement    = slotAddress - sourceAddress;
+
+          outs() << "BOLT-INFO.REPAIR-EDGES:\n" << "primaryDisplacement "
+                 << primaryDisplacement << "\nslotDisplacement "
+                 << slotDisplacement << "\n";
+        }
+    }
+
+    return Error::success();
+  }
+
+  Error addThunkSpace(jitlink::LinkGraph &G) {
+    for (jitlink::Section &Section : G.sections()) {
+      auto Blocks = JITLinkLinker::orderedBlocks(Section);
+      for (jitlink::Block *Block : Blocks) {
+        std::vector<jitlink::Edge::OffsetT> Offsets;
+        for (const jitlink::Edge &Edge : Block->edges()) {
+          if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
+            continue;
+
+          Offsets.emplace_back(Edge.getOffset());
+        }
+
+        uint64_t Branch26Num = Offsets.size();
+        if (!Branch26Num)
+          continue;
+
+        jitlink::Block &stubBlock = G.createMutableContentBlock(Section,
+                                                                G.allocateBuffer(20 * Branch26Num),
+                                                                Block->getAddress() + Block->getSize(),
+                                                                4, 0);
+        auto Content = stubBlock.getAlreadyMutableContent();
+        for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
+          support::endian::write32le(Content.data() + Offset, /*aarch64 nop code*/0xd503201f);
+
+        for (uint64_t SymbolNum = 0; SymbolNum < Branch26Num; ++SymbolNum) {
+
+          StubRecords.push_back(StubRecord{Block, Offsets[SymbolNum],
+                                           &G.addAnonymousSymbol(stubBlock, 20 * SymbolNum,
+                                                                 20, true, true)});
+        }
+      }
+    }
 
     return Error::success();
   }
