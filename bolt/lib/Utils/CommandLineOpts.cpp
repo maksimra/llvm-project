@@ -114,6 +114,11 @@ cl::opt<bool> VerifyBranch26Range(
     cl::desc("AArch64 Branch26 range veryfier"),
     cl::init(false), cl::Hidden, cl::cat(BoltCategory));
 
+cl::opt<bool> DoNotUseStubs(
+    "turn-off-stubs",
+    cl::desc("don't relax inter-function branches and calls"),
+    cl::init(false), cl::Hidden, cl::cat(BoltCategory));
+
 cl::opt<bool>
 DiffOnly("diff-only",
   cl::desc("stop processing once we have enough to compare two binaries"),
