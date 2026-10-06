@@ -18,6 +18,7 @@
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "bolt"
 
@@ -72,6 +73,47 @@ void reassignSectionAddress(jitlink::LinkGraph &LG,
     Block->setAddress(orc::ExecutorAddr(BlockAddress));
     BlockAddress += Block->getSize();
   }
+}
+
+Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
+                            jitlink::Edge::AddendT Addend,
+                            bool HasFixedLoadAddress) {
+  const auto TargetAddress = Target.getAddress() + Addend;
+
+  const int64_t PageDelta =
+      static_cast<int64_t>(TargetAddress.getValue() >> 12) -
+      static_cast<int64_t>(SlotSym.getAddress().getValue() >> 12);
+  const bool UseADRP = isInt<21>(PageDelta);
+  if (!UseADRP && !HasFixedLoadAddress)
+    return make_error<jitlink::JITLinkError>(
+        "Cannot materialize AArch64 branch stub at 0x" +
+        Twine::utohexstr(SlotSym.getAddress().getValue()) + " for target 0x" +
+        Twine::utohexstr(TargetAddress.getValue()) +
+        ": target is outside ADRP range and the binary has no fixed load "
+        "address");
+
+  auto &SlotBlock = SlotSym.getBlock();
+  const auto SlotOffset = SlotSym.getOffset();
+  auto Slot = SlotBlock.getAlreadyMutableContent().slice(SlotOffset, 20);
+  if (UseADRP) {
+    support::endian::write32le(Slot.data(), 0x90000010);     // ADRP x16
+    support::endian::write32le(Slot.data() + 4, 0x91000210); // ADD x16, x16
+    support::endian::write32le(Slot.data() + 8, 0xd61f0200); // BR x16
+    SlotBlock.addEdge(jitlink::aarch64::Page21, SlotOffset, Target, Addend);
+    SlotBlock.addEdge(jitlink::aarch64::PageOffset12, SlotOffset + 4, Target,
+                      Addend);
+    // Leave the final eight bytes as reserved NOPs.
+  } else {
+    for (unsigned I = 0; I != 4; ++I) {
+      const uint32_t Imm16 = (TargetAddress.getValue() >> (16 * I)) & 0xffff;
+      // MOVZ x16 for the first chunk, MOVK x16 for the rest.
+      const uint32_t Opcode = I == 0 ? 0xd2800000 : 0xf2800000;
+      const uint32_t Instr = Opcode | (I << 21) | (Imm16 << 5) | 16;
+      support::endian::write32le(Slot.data() + 4 * I, Instr);
+    }
+    support::endian::write32le(Slot.data() + 16, 0xd61f0200); // BR x16
+  }
+  return Error::success();
 }
 
 } // anonymous namespace
@@ -143,17 +185,28 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
         if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
           continue;
 
-          orc::ExecutorAddr sourceAddress = Record.SourceBlock->getFixupAddress(Edge);
-          orc::ExecutorAddr targetAddress = Edge.getTarget().getAddress() + Edge.getAddend();
-          orc::ExecutorAddr slotAddress = Record.SlotSym->getAddress();
+        const auto SourceAddress = Record.SourceBlock->getFixupAddress(Edge);
+        const auto TargetAddress =
+            Edge.getTarget().getAddress() + Edge.getAddend();
+        const int64_t Displacement = TargetAddress - SourceAddress;
+        if (isInt<28>(Displacement))
+          continue;
 
-          int64_t primaryDisplacement = targetAddress - sourceAddress;
-          int64_t slotDisplacement    = slotAddress - sourceAddress;
+        const int64_t SlotDisplacement = Record.SlotSym->getAddress() -
+                                         SourceAddress;
 
-          outs() << "BOLT-INFO.REPAIR-EDGES:\n" << "primaryDisplacement "
-                 << primaryDisplacement << "\nslotDisplacement "
-                 << slotDisplacement << "\n";
-        }
+        if (!isInt<28>(SlotDisplacement))
+          return make_error<jitlink::JITLinkError>(
+              "Reserved AArch64 branch stub is out of Branch26 range");
+
+        if (Error Err = materializeAArch64Stub(
+                *Record.SlotSym, Edge.getTarget(), Edge.getAddend(),
+                Linker.BC.HasFixedLoadAddress))
+          return Err;
+
+        Edge.setTarget(*Record.SlotSym);
+        Edge.setAddend(0);
+      }
     }
 
     return Error::success();
