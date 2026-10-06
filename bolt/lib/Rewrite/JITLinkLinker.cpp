@@ -102,6 +102,8 @@ Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
     SlotBlock.addEdge(jitlink::aarch64::Page21, SlotOffset, Target, Addend);
     SlotBlock.addEdge(jitlink::aarch64::PageOffset12, SlotOffset + 4, Target,
                       Addend);
+
+    outs() << "BOLT-INFO: short jump stub was materialized.\n";
     // Leave the final eight bytes as reserved NOPs.
   } else {
     for (unsigned I = 0; I != 4; ++I) {
@@ -112,6 +114,7 @@ Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
       support::endian::write32le(Slot.data() + 4 * I, Instr);
     }
     support::endian::write32le(Slot.data() + 16, 0xd61f0200); // BR x16
+    outs() << "BOLT-INFO: long jump stub was materialized.\n";
   }
   return Error::success();
 }
@@ -189,11 +192,16 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
         const auto TargetAddress =
             Edge.getTarget().getAddress() + Edge.getAddend();
         const int64_t Displacement = TargetAddress - SourceAddress;
+        outs() << "BOLT-INFO: edge for " << Edge.getTarget().getName()
+               << " has " << Displacement << " displacement.\n";
+
         if (isInt<28>(Displacement))
           continue;
 
         const int64_t SlotDisplacement = Record.SlotSym->getAddress() -
                                          SourceAddress;
+        outs() << "BOLT-INFO: that is out of range. And slot displacement is "
+               << SlotDisplacement << "\n";
 
         if (!isInt<28>(SlotDisplacement))
           return make_error<jitlink::JITLinkError>(
@@ -221,6 +229,9 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
           if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
             continue;
 
+          outs() << "BOLT-INFO: reserve stub slot for "
+                 << Edge.getTarget().getName() << "\n";
+
           Offsets.emplace_back(Edge.getOffset());
         }
 
@@ -232,6 +243,10 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                                                                 G.allocateBuffer(20 * Branch26Num),
                                                                 Block->getAddress() + Block->getSize(),
                                                                 4, 0);
+
+        outs() << "BOLT-INFO: created " << Branch26Num << " slots after block"
+                  " for stubs\n";
+
         auto Content = stubBlock.getAlreadyMutableContent();
         for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
           support::endian::write32le(Content.data() + Offset, /*aarch64 nop code*/0xd503201f);
