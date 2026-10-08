@@ -74,6 +74,14 @@ class BinaryFunction;
 using BinaryFunctionListType = std::vector<BinaryFunction *>;
 using ConstBinaryFunctionListType = std::vector<const BinaryFunction *>;
 
+/// An emitted fragment's private MC section and its logical output section.
+struct EmittedFragmentSection {
+  std::string Name;
+  std::string OutputSection;
+  uint64_t OutputAlignment;
+  bool HasFallThrough;
+};
+
 /// Information on loadable part of the file.
 struct SegmentInfo {
   uint64_t Address;           /// Address of the segment in memory.
@@ -314,6 +322,9 @@ public:
   /// multiple compilation units, instructions may reference debug line
   /// information from multiple CUs.
   ClusteredRowsContainer ClusteredRows;
+
+  /// Private code sections, in emission order, for deferred AArch64 stubs.
+  std::vector<EmittedFragmentSection> EmittedFragmentSections;
 
   // Setup MCPlus target builder
   void initializeTarget(std::unique_ptr<MCPlusBuilder> TargetBuilder) {

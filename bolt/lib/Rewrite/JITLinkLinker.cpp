@@ -11,14 +11,16 @@
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
 #include "bolt/Utils/CommandLineOpts.h"
-#include "llvm/ExecutionEngine/JITLink/aarch64.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/aarch64.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MathExtras.h"
+#include <limits>
 
 #define DEBUG_TYPE "bolt"
 
@@ -144,6 +146,11 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
     Config.PrePrunePasses.push_back(markSectionsLive);
 
     if (opts::DoNotUseStubs && G.getTargetTriple().isAArch64()) {
+      if (Linker.BC.isELF() && !Linker.MM->ObjectsLoaded) {
+        Config.PostPrunePasses.push_back([this](auto &G) {
+          return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections);
+        });
+      }
       Config.PostPrunePasses.push_back([this](auto &G) {
         return addThunkSpace(G); });
 
@@ -183,7 +190,9 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
         const auto TargetAddress =
             Edge.getTarget().getAddress() + Edge.getAddend();
         const int64_t Displacement = TargetAddress - SourceAddress;
-        outs() << "BOLT-INFO: edge for " << Edge.getTarget().getName()
+        outs() << "BOLT-INFO: edge for "
+               << (Edge.getTarget().hasName() ? *Edge.getTarget().getName()
+                                              : "<anonymous>")
                << " has " << Displacement << " displacement.\n";
 
         if (isInt<28>(Displacement))
@@ -221,7 +230,9 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
             continue;
 
           outs() << "BOLT-INFO: reserve stub slot for "
-                 << Edge.getTarget().getName() << "\n";
+                 << (Edge.getTarget().hasName() ? *Edge.getTarget().getName()
+                                                : "<anonymous>")
+                 << "\n";
 
           Offsets.emplace_back(Edge.getOffset());
         }
@@ -414,6 +425,156 @@ size_t JITLinkLinker::sectionSize(const jitlink::Section &Section) {
   }
 
   return Size;
+}
+
+namespace {
+
+struct FragmentSectionLayout {
+  SmallVector<jitlink::Block *> Blocks;
+  uint64_t Alignment = 1;
+};
+using FragmentSectionLayouts =
+    MapVector<jitlink::Section *, FragmentSectionLayout>;
+
+Error validateFragmentEdge(const jitlink::Block &Source,
+                           const jitlink::Edge &Edge) {
+  const auto &Target = Edge.getTarget();
+  int64_t Addend = Edge.getAddend();
+  if (Edge.getKind() == jitlink::aarch64::NegDelta32 ||
+      Edge.getKind() == jitlink::aarch64::NegDelta64) {
+    if (Addend == std::numeric_limits<int64_t>::min())
+      return make_error<jitlink::JITLinkError>(
+          "Unsupported addend in emitted fragment section");
+    Addend = -Addend;
+  }
+  const uint64_t Offset = Target.getOffset();
+  const uint64_t Size = Target.getBlock().getSize();
+  // emitLSDA may use LPStart-1 to distinguish a landing pad at offset zero
+  // from "no landing pad". This is an arithmetic base, not a code target.
+  if (Edge.getKind() == jitlink::aarch64::Delta32 && Offset == 0 &&
+      Addend == -1 && Source.getSection().getName() == ".gcc_except_table")
+    return Error::success();
+  if (Offset > Size || (Addend >= 0 && uint64_t(Addend) > Size - Offset) ||
+      (Addend < 0 && uint64_t(-(Addend + 1)) + 1 > Offset))
+    return make_error<jitlink::JITLinkError>(
+        "Relocation target leaves emitted fragment section " +
+        Target.getSection().getName());
+  // One-past is useful for metadata, but a branch there would enter the
+  // reserved island instead of the next function. Reject this case.
+  if ((Edge.getKind() == jitlink::aarch64::Branch26PCRel ||
+       Edge.getKind() == jitlink::aarch64::CondBranch19PCRel ||
+       Edge.getKind() == jitlink::aarch64::TestAndBranch14PCRel) &&
+      Offset + Addend == Size)
+    return make_error<jitlink::JITLinkError>(
+        "Branch target is at the end of emitted fragment section " +
+        Target.getSection().getName());
+  return Error::success();
+}
+
+Error validateFragmentEdges(jitlink::LinkGraph &G,
+                            const DenseSet<jitlink::Block *> &FragmentBlocks) {
+  // S+A must stay in the original fragment. In particular, a section symbol
+  // must not be reinterpreted as the start of the merged output section.
+  for (auto *Block : G.blocks()) {
+    for (const auto &Edge : Block->edges()) {
+      const auto &Target = Edge.getTarget();
+      if (!Edge.isRelocation() || !Target.isDefined() ||
+          !FragmentBlocks.contains(&Target.getBlock()))
+        continue;
+      if (Error Err = validateFragmentEdge(*Block, Edge))
+        return Err;
+    }
+  }
+  return Error::success();
+}
+
+Error mergeFragmentSection(jitlink::LinkGraph &G,
+                           const EmittedFragmentSection &Fragment,
+                           jitlink::Section &Input,
+                           FragmentSectionLayouts &Layouts) {
+  if (Fragment.HasFallThrough)
+    return make_error<jitlink::JITLinkError>(
+        "Cannot independently place AArch64 fragment with fall-through: " +
+        Fragment.Name);
+  auto *Output = G.findSectionByName(Fragment.OutputSection);
+  if (!Output) {
+    Output = &G.createSection(Fragment.OutputSection, Input.getMemProt());
+    Output->setMemLifetime(Input.getMemLifetime());
+    Output->setOrdinal(Input.getOrdinal());
+  }
+  if (Output == &Input || Output->getMemProt() != Input.getMemProt() ||
+      Output->getMemLifetime() != Input.getMemLifetime())
+    return make_error<jitlink::JITLinkError>(
+        "Incompatible logical output section for " + Fragment.Name);
+  auto [It, Inserted] = Layouts.try_emplace(Output);
+  auto &Layout = It->second;
+  if (Inserted)
+    llvm::append_range(Layout.Blocks, JITLinkLinker::orderedBlocks(*Output));
+  Layout.Alignment = std::max(Layout.Alignment, Fragment.OutputAlignment);
+  llvm::append_range(Layout.Blocks, JITLinkLinker::orderedBlocks(Input));
+  G.mergeSections(*Output, Input);
+  return Error::success();
+}
+
+Error assignFragmentOrderKeys(jitlink::Section &Section,
+                              FragmentSectionLayout &Layout) {
+  if (Layout.Blocks.empty())
+    return Error::success();
+  for (auto *Block : Layout.Blocks)
+    Layout.Alignment = std::max(Layout.Alignment, Block->getAlignment());
+  // The memory manager gets the section alignment from the first block.
+  // Only promote that block, not every function to the text section alignment.
+  if (Layout.Blocks.front()->getAlignmentOffset())
+    return make_error<jitlink::JITLinkError>(
+        "Unsupported first block alignment offset in " + Section.getName());
+  Layout.Blocks.front()->setAlignment(Layout.Alignment);
+
+  uint64_t Offset = 0;
+  for (auto *Block : Layout.Blocks) {
+    Offset = jitlink::alignToBlock(Offset, *Block);
+    Block->setAddress(orc::ExecutorAddr(Offset));
+    // These are ordering keys, not final addresses. Even empty marker blocks
+    // need distinct keys, and the existing reservation pass will insert a
+    // block at each source block's end. Leave room for those 20-byte slots.
+    Offset += std::max<uint64_t>(1, Block->getSize());
+    uint64_t NumBranches = llvm::count_if(Block->edges(), [](const auto &E) {
+      return E.getKind() == jitlink::aarch64::Branch26PCRel;
+    });
+    if (NumBranches)
+      Offset = alignTo(Offset, 4) + 20 * NumBranches;
+  }
+  return Error::success();
+}
+
+} // namespace
+
+Error JITLinkLinker::mergeFragmentSections(
+    jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments) {
+  FragmentSectionLayouts Layouts;
+  DenseSet<jitlink::Block *> FragmentBlocks;
+  SmallVector<jitlink::Section *> Sections;
+  for (const auto &Fragment : Fragments) {
+    auto *Section = G.findSectionByName(Fragment.Name);
+    if (!Section)
+      return make_error<jitlink::JITLinkError>(
+          "Missing emitted fragment section " + Fragment.Name);
+    Sections.push_back(Section);
+    for (auto *Block : Section->blocks())
+      FragmentBlocks.insert(Block);
+  }
+
+  if (Error Err = validateFragmentEdges(G, FragmentBlocks))
+    return Err;
+
+  for (auto [Index, Fragment] : llvm::enumerate(Fragments))
+    if (Error Err =
+            mergeFragmentSection(G, Fragment, *Sections[Index], Layouts))
+      return Err;
+
+  for (auto &[Section, Layout] : Layouts)
+    if (Error Err = assignFragmentOrderKeys(*Section, Layout))
+      return Err;
+  return Error::success();
 }
 
 void JITLinkLinker::assignBlockAddresses(jitlink::Section &Section,

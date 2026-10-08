@@ -24,6 +24,7 @@ namespace llvm {
 namespace bolt {
 
 class BinaryContext;
+struct EmittedFragmentSection;
 
 class JITLinkLinker : public BOLTLinker {
 private:
@@ -48,6 +49,9 @@ public:
   orderedBlocks(const jitlink::Section &Section);
   static size_t sectionSize(const jitlink::Section &Section);
   static void assignBlockAddresses(jitlink::Section &Section, uint64_t Address);
+  static Error
+  mergeFragmentSections(jitlink::LinkGraph &G,
+                        ArrayRef<EmittedFragmentSection> Fragments);
 };
 
 } // namespace bolt

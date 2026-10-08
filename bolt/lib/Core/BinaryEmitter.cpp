@@ -102,6 +102,27 @@ size_t padFunctionAfter(const BinaryFunction &Function) {
 namespace {
 using JumpTable = bolt::JumpTable;
 
+bool useFragmentSections(const BinaryContext &BC) {
+  return opts::DoNotUseStubs && BC.isELF() && BC.isAArch64();
+}
+
+bool fragmentMayFallThrough(const FunctionFragment &Fragment,
+                            const BinaryContext &BC) {
+  for (const BinaryBasicBlock *BB : llvm::reverse(Fragment)) {
+    const MCInst *Last = BB->getLastNonPseudoInstr();
+    if (!Last)
+      continue;
+
+    // Tail-call annotations may have been removed by InstructionLowering.
+    // Inspect the opcode, not BOLT's isCall/isTailCall predicates. isTerminator
+    // uses opcode properties and also honors the terminal-trap option.
+    const MCInstrDesc &Desc = BC.MII->get(Last->getOpcode());
+    return !BC.MIB->isTerminator(*Last) || Desc.isConditionalBranch() ||
+           Desc.isCall();
+  }
+  return false;
+}
+
 class BinaryEmitter {
 private:
   BinaryEmitter(const BinaryEmitter &) = delete;
@@ -184,6 +205,15 @@ private:
 } // anonymous namespace
 
 void BinaryEmitter::emitAll(StringRef OrgSecPrefix) {
+  if (useFragmentSections(BC)) {
+    if (!BC.HasRelocations) {
+      BC.Ctx->reportError(SMLoc(),
+                          "--turn-off-stubs requires relocation mode for "
+                          "independently placed AArch64 fragments");
+      return;
+    }
+  }
+
   Streamer.initSections(*BC.STI);
   Streamer.setUseAssemblerInfoForParsing(false);
 
@@ -276,10 +306,20 @@ void BinaryEmitter::emitFunctions() {
 
   // Mark the end of hot text.
   if (opts::HotText) {
-    if (BC.HasWarmSection)
-      Streamer.switchSection(BC.getCodeSection(BC.getWarmCodeSectionName()));
-    else
-      Streamer.switchSection(BC.getTextSection());
+    MCSection *EndSection = BC.HasWarmSection
+                                ? BC.getCodeSection(BC.getWarmCodeSectionName())
+                                : BC.getTextSection();
+    if (useFragmentSections(BC)) {
+      for (const auto &Fragment : llvm::reverse(BC.EmittedFragmentSections)) {
+        if (Fragment.OutputSection == EndSection->getName()) {
+          EndSection = BC.getCodeSection(Fragment.Name);
+          break;
+        }
+      }
+      // If no fragment was emitted into this logical section (e.g. an empty
+      // warm section), keep the marker in the logical section itself.
+    }
+    Streamer.switchSection(EndSection);
     Streamer.emitLabel(BC.getHotTextEndSymbol());
   }
 }
@@ -299,6 +339,15 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 
   MCSection *Section =
       BC.getCodeSection(Function.getCodeSectionName(FF.getFragmentNum()));
+  if (useFragmentSections(BC)) {
+    std::string Name =
+        (Twine(".bolt.fragment.") + Twine(BC.EmittedFragmentSections.size()))
+            .str();
+    BC.EmittedFragmentSections.push_back({Name, Section->getName().str(),
+                                          Section->getAlign().value(),
+                                          fragmentMayFallThrough(FF, BC)});
+    Section = BC.getCodeSection(Name);
+  }
   Streamer.switchSection(Section);
   Section->setHasInstructions(true);
   BC.Ctx->addGenDwarfSection(Section);
