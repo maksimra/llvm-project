@@ -473,6 +473,8 @@ Error validateFragmentEdge(const jitlink::Block &Source,
 
 Error validateFragmentEdges(jitlink::LinkGraph &G,
                             const DenseSet<jitlink::Block *> &FragmentBlocks) {
+  outs() << "BOLT-INFO: Fragment Edges validation.\n";
+
   // S+A must stay in the original fragment. In particular, a section symbol
   // must not be reinterpreted as the start of the merged output section.
   for (auto *Block : G.blocks()) {
@@ -550,10 +552,14 @@ Error assignFragmentOrderKeys(jitlink::Section &Section,
 
 Error JITLinkLinker::mergeFragmentSections(
     jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments) {
+  outs() << "BOLT-INFO: begin of Fragment Sections merging.\n";
+
   FragmentSectionLayouts Layouts;
   DenseSet<jitlink::Block *> FragmentBlocks;
   SmallVector<jitlink::Section *> Sections;
   for (const auto &Fragment : Fragments) {
+    outs() << "Fragment " << Fragment.Name << " and output section "
+           << Fragment.OutputSection << '\n';
     auto *Section = G.findSectionByName(Fragment.Name);
     if (!Section)
       return make_error<jitlink::JITLinkError>(

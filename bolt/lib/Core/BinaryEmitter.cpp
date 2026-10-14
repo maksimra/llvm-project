@@ -343,9 +343,13 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
     std::string Name =
         (Twine(".bolt.fragment.") + Twine(BC.EmittedFragmentSections.size()))
             .str();
+    bool HasFallThrough = fragmentMayFallThrough(FF, BC);
+    if (HasFallThrough)
+      BC.outs() << "BOLT-WARNING: fragment has fall through.\n";
+
     BC.EmittedFragmentSections.push_back({Name, Section->getName().str(),
                                           Section->getAlign().value(),
-                                          fragmentMayFallThrough(FF, BC)});
+                                          HasFallThrough});
     Section = BC.getCodeSection(Name);
   }
   Streamer.switchSection(Section);

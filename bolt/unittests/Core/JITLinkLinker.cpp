@@ -16,7 +16,7 @@ using namespace llvm::jitlink;
 
 TEST(JITLinkLinkerTest, AssignBlockAddressesRespectsAlignment) {
   LinkGraph G("test", std::make_shared<orc::SymbolStringPool>(),
-              Triple("x86_64-unknown-linux"), SubtargetFeatures(),
+              Triple("x86_64-unknown-linux"), 8, SubtargetFeatures(),
               getGenericEdgeKindName);
   auto &Section =
       G.createSection(".data", orc::MemProt::Read | orc::MemProt::Write);
