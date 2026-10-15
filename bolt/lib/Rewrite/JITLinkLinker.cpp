@@ -124,6 +124,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
     jitlink::Symbol *SlotSym;
   };
   std::vector<StubRecord> StubRecords;
+  DenseSet<jitlink::Block *> FallThroughBlocks;
 
   Context(JITLinkLinker &Linker, JITLinkLinker::SectionsMapper MapSections)
       : JITLinkContext(&Linker.Dylib), Linker(Linker),
@@ -148,7 +149,8 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
     if (opts::DoNotUseStubs && G.getTargetTriple().isAArch64()) {
       if (Linker.BC.isELF() && !Linker.MM->ObjectsLoaded) {
         Config.PostPrunePasses.push_back([this](auto &G) {
-          return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections);
+          return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections,
+                                       FallThroughBlocks);
         });
       }
       Config.PostPrunePasses.push_back([this](auto &G) {
@@ -223,7 +225,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   Error addThunkSpace(jitlink::LinkGraph &G) {
     for (jitlink::Section &Section : G.sections()) {
       auto Blocks = JITLinkLinker::orderedBlocks(Section);
-      for (jitlink::Block *Block : Blocks) {
+      for (auto [Index, Block] : llvm::enumerate(Blocks)) {
         std::vector<jitlink::Edge::OffsetT> Offsets;
         for (const jitlink::Edge &Edge : Block->edges()) {
           if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
@@ -238,26 +240,44 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
         }
 
         uint64_t Branch26Num = Offsets.size();
-        if (!Branch26Num)
-          continue;
+        jitlink::Block *EndBlock = Block;
+        if (Branch26Num) {
+          jitlink::Block &StubBlock = G.createMutableContentBlock(
+              Section, G.allocateBuffer(20 * Branch26Num),
+              Block->getAddress() + Block->getSize(), 4, 0);
 
-        jitlink::Block &stubBlock = G.createMutableContentBlock(Section,
-                                                                G.allocateBuffer(20 * Branch26Num),
-                                                                Block->getAddress() + Block->getSize(),
-                                                                4, 0);
+          outs() << "BOLT-INFO: created " << Branch26Num
+                 << " slots after block for stubs\n";
 
-        outs() << "BOLT-INFO: created " << Branch26Num << " slots after block"
-                  " for stubs\n";
+          auto Content = StubBlock.getAlreadyMutableContent();
+          for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
+            support::endian::write32le(Content.data() + Offset,
+                                       0xd503201f); // NOP
 
-        auto Content = stubBlock.getAlreadyMutableContent();
-        for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
-          support::endian::write32le(Content.data() + Offset, /*aarch64 nop code*/0xd503201f);
+          for (uint64_t SymbolNum = 0; SymbolNum < Branch26Num; ++SymbolNum) {
+            StubRecords.push_back(
+                StubRecord{Block, Offsets[SymbolNum],
+                           &G.addAnonymousSymbol(StubBlock, 20 * SymbolNum, 20,
+                                                 true, true)});
+          }
+          EndBlock = &StubBlock;
+        }
 
-        for (uint64_t SymbolNum = 0; SymbolNum < Branch26Num; ++SymbolNum) {
-
-          StubRecords.push_back(StubRecord{Block, Offsets[SymbolNum],
-                                           &G.addAnonymousSymbol(stubBlock, 20 * SymbolNum,
-                                                                 20, true, true)});
+        if (FallThroughBlocks.contains(Block)) {
+          // Target the next block itself to skip its alignment padding too.
+          // At section end, preserve the original one-past continuation.
+          auto &Continuation =
+              Index + 1 < Blocks.size()
+                  ? G.addAnonymousSymbol(*Blocks[Index + 1], 0, 0, true, true)
+                  : G.addAnonymousSymbol(*EndBlock, EndBlock->getSize(), 0,
+                                         true, true);
+          // Add this edge after reserving slots: the guard needs no stub.
+          const auto BranchOffset = Block->getSize() - 4;
+          // MC resolved the placeholder locally; JITLink expects a zero imm26.
+          support::endian::write32le(
+              Block->getMutableContent(G).data() + BranchOffset, 0x14000000);
+          Block->addEdge(jitlink::aarch64::Branch26PCRel, BranchOffset,
+                         Continuation, 0);
         }
       }
     }
@@ -493,11 +513,8 @@ Error validateFragmentEdges(jitlink::LinkGraph &G,
 Error mergeFragmentSection(jitlink::LinkGraph &G,
                            const EmittedFragmentSection &Fragment,
                            jitlink::Section &Input,
-                           FragmentSectionLayouts &Layouts) {
-  if (Fragment.HasFallThrough)
-    return make_error<jitlink::JITLinkError>(
-        "Cannot independently place AArch64 fragment with fall-through: " +
-        Fragment.Name);
+                           FragmentSectionLayouts &Layouts,
+                           DenseSet<jitlink::Block *> &FallThroughBlocks) {
   auto *Output = G.findSectionByName(Fragment.OutputSection);
   if (!Output) {
     Output = &G.createSection(Fragment.OutputSection, Input.getMemProt());
@@ -513,7 +530,13 @@ Error mergeFragmentSection(jitlink::LinkGraph &G,
   if (Inserted)
     llvm::append_range(Layout.Blocks, JITLinkLinker::orderedBlocks(*Output));
   Layout.Alignment = std::max(Layout.Alignment, Fragment.OutputAlignment);
-  llvm::append_range(Layout.Blocks, JITLinkLinker::orderedBlocks(Input));
+  auto Blocks = JITLinkLinker::orderedBlocks(Input);
+  if (Fragment.HasFallThrough) {
+    assert(!Blocks.empty() && Blocks.back()->getSize() >= 4 &&
+           "Missing emitted fall-through branch");
+    FallThroughBlocks.insert(Blocks.back());
+  }
+  llvm::append_range(Layout.Blocks, Blocks);
   G.mergeSections(*Output, Input);
   return Error::success();
 }
@@ -551,7 +574,8 @@ Error assignFragmentOrderKeys(jitlink::Section &Section,
 } // namespace
 
 Error JITLinkLinker::mergeFragmentSections(
-    jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments) {
+    jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments,
+    DenseSet<jitlink::Block *> &FallThroughBlocks) {
   outs() << "BOLT-INFO: begin of Fragment Sections merging.\n";
 
   FragmentSectionLayouts Layouts;
@@ -573,8 +597,8 @@ Error JITLinkLinker::mergeFragmentSections(
     return Err;
 
   for (auto [Index, Fragment] : llvm::enumerate(Fragments))
-    if (Error Err =
-            mergeFragmentSection(G, Fragment, *Sections[Index], Layouts))
+    if (Error Err = mergeFragmentSection(G, Fragment, *Sections[Index], Layouts,
+                                         FallThroughBlocks))
       return Err;
 
   for (auto &[Section, Layout] : Layouts)

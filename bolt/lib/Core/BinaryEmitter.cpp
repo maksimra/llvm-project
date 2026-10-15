@@ -339,14 +339,12 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 
   MCSection *Section =
       BC.getCodeSection(Function.getCodeSectionName(FF.getFragmentNum()));
+  const bool HasFallThrough =
+      useFragmentSections(BC) && fragmentMayFallThrough(FF, BC);
   if (useFragmentSections(BC)) {
     std::string Name =
         (Twine(".bolt.fragment.") + Twine(BC.EmittedFragmentSections.size()))
             .str();
-    bool HasFallThrough = fragmentMayFallThrough(FF, BC);
-    if (HasFallThrough)
-      BC.outs() << "BOLT-WARNING: fragment has fall through.\n";
-
     BC.EmittedFragmentSections.push_back({Name, Section->getName().str(),
                                           Section->getAlign().value(),
                                           HasFallThrough});
@@ -462,11 +460,19 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   if (opts::MarkFuncs)
     Streamer.emitBytes(BC.MIB->getTrapFillValue());
 
+  MCSymbol *EndSymbol = Function.getFunctionEndLabel(FF.getFragmentNum());
+  if (HasFallThrough) {
+    // Keep the branch in the fragment's FDE with the final CFI state.
+    // JITLink will retarget it past the reserved stub space.
+    MCInst Branch;
+    BC.MIB->createUncondBranch(Branch, EndSymbol, BC.Ctx.get());
+    Streamer.emitInstruction(Branch, *BC.STI);
+  }
+
   // Emit CFI end
   if (NeedsFDE)
     Streamer.emitCFIEndProc();
 
-  MCSymbol *EndSymbol = Function.getFunctionEndLabel(FF.getFragmentNum());
   Streamer.emitLabel(EndSymbol);
 
   if (MAI.hasDotTypeDotSizeDirective()) {

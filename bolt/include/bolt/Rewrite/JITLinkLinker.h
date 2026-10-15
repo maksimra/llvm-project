@@ -15,6 +15,7 @@
 
 #include "bolt/Core/Linker.h"
 #include "bolt/Rewrite/ExecutableFileMemoryManager.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 
 #include <memory>
@@ -49,9 +50,11 @@ public:
   orderedBlocks(const jitlink::Section &Section);
   static size_t sectionSize(const jitlink::Section &Section);
   static void assignBlockAddresses(jitlink::Section &Section, uint64_t Address);
+  /// Merge fragment sections and collect blocks with fall-through guards.
   static Error
   mergeFragmentSections(jitlink::LinkGraph &G,
-                        ArrayRef<EmittedFragmentSection> Fragments);
+                        ArrayRef<EmittedFragmentSection> Fragments,
+                        DenseSet<jitlink::Block *> &FallThroughBlocks);
 };
 
 } // namespace bolt
