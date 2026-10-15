@@ -124,6 +124,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
     jitlink::Symbol *SlotSym;
   };
   std::vector<StubRecord> StubRecords;
+  DenseSet<jitlink::Block *> FallThroughBlocks;
 
   Context(JITLinkLinker &Linker, JITLinkLinker::SectionsMapper MapSections)
       : JITLinkContext(&Linker.Dylib), Linker(Linker),
@@ -148,7 +149,8 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
     if (opts::DoNotUseStubs && G.getTargetTriple().isAArch64()) {
       if (Linker.BC.isELF() && !Linker.MM->ObjectsLoaded) {
         Config.PostPrunePasses.push_back([this](auto &G) {
-          return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections);
+          return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections,
+                                       FallThroughBlocks);
         });
       }
       Config.PostPrunePasses.push_back([this](auto &G) {
@@ -223,7 +225,34 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   Error addThunkSpace(jitlink::LinkGraph &G) {
     for (jitlink::Section &Section : G.sections()) {
       auto Blocks = JITLinkLinker::orderedBlocks(Section);
-      for (jitlink::Block *Block : Blocks) {
+      uint64_t BlockOrder = 0;
+      for (auto [Index, Block] : llvm::enumerate(Blocks)) {
+        // Addresses remain ordering keys until allocation. Include
+        // source blocks, stub blocks and the one-past end marker.
+        Block->setAddress(orc::ExecutorAddr(BlockOrder++));
+        jitlink::Block *EndMarker = nullptr;
+        if (FallThroughBlocks.contains(Block)) {
+          // Install the guard before collecting branches so it receives a stub
+          // reservation and is relaxed using the final layout too.
+          jitlink::Block *ContinuationBlock;
+          if (Index + 1 < Blocks.size()) {
+            // Skip the next block's alignment padding as well as our stubs.
+            ContinuationBlock = Blocks[Index + 1];
+          } else {
+            // Keep the one-past continuation after all slots, including the
+            // guard's own reservation. The marker itself occupies no space.
+            EndMarker =
+                &G.createZeroFillBlock(Section, 0, orc::ExecutorAddr(), 1, 0);
+            ContinuationBlock = EndMarker;
+          }
+          auto &Continuation =
+              G.addAnonymousSymbol(*ContinuationBlock, 0, 0, true, true);
+          const auto BranchOffset = Block->getSize() - 4;
+          support::endian::write32le(
+              Block->getMutableContent(G).data() + BranchOffset, 0x14000000);
+          Block->addEdge(jitlink::aarch64::Branch26PCRel, BranchOffset,
+                         Continuation, 0);
+        }
         std::vector<jitlink::Edge::OffsetT> Offsets;
         for (const jitlink::Edge &Edge : Block->edges()) {
           if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
@@ -238,27 +267,29 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
         }
 
         uint64_t Branch26Num = Offsets.size();
-        if (!Branch26Num)
-          continue;
+        if (Branch26Num) {
+          jitlink::Block &StubBlock = G.createMutableContentBlock(
+              Section, G.allocateBuffer(20 * Branch26Num),
+              orc::ExecutorAddr(BlockOrder++), 4, 0);
 
-        jitlink::Block &stubBlock = G.createMutableContentBlock(Section,
-                                                                G.allocateBuffer(20 * Branch26Num),
-                                                                Block->getAddress() + Block->getSize(),
-                                                                4, 0);
+          outs() << "BOLT-INFO: created " << Branch26Num
+                 << " slots after block for stubs\n";
 
-        outs() << "BOLT-INFO: created " << Branch26Num << " slots after block"
-                  " for stubs\n";
+          auto Content = StubBlock.getAlreadyMutableContent();
+          for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
+            support::endian::write32le(Content.data() + Offset,
+                                       0xd503201f); // NOP
 
-        auto Content = stubBlock.getAlreadyMutableContent();
-        for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
-          support::endian::write32le(Content.data() + Offset, /*aarch64 nop code*/0xd503201f);
-
-        for (uint64_t SymbolNum = 0; SymbolNum < Branch26Num; ++SymbolNum) {
-
-          StubRecords.push_back(StubRecord{Block, Offsets[SymbolNum],
-                                           &G.addAnonymousSymbol(stubBlock, 20 * SymbolNum,
-                                                                 20, true, true)});
+          for (uint64_t SymbolNum = 0; SymbolNum < Branch26Num; ++SymbolNum) {
+            StubRecords.push_back(
+                StubRecord{Block, Offsets[SymbolNum],
+                           &G.addAnonymousSymbol(StubBlock, 20 * SymbolNum, 20,
+                                                 true, true)});
+          }
         }
+
+        if (EndMarker)
+          EndMarker->setAddress(orc::ExecutorAddr(BlockOrder++));
       }
     }
 
@@ -493,11 +524,8 @@ Error validateFragmentEdges(jitlink::LinkGraph &G,
 Error mergeFragmentSection(jitlink::LinkGraph &G,
                            const EmittedFragmentSection &Fragment,
                            jitlink::Section &Input,
-                           FragmentSectionLayouts &Layouts) {
-  if (Fragment.HasFallThrough)
-    return make_error<jitlink::JITLinkError>(
-        "Cannot independently place AArch64 fragment with fall-through: " +
-        Fragment.Name);
+                           FragmentSectionLayouts &Layouts,
+                           DenseSet<jitlink::Block *> &FallThroughBlocks) {
   auto *Output = G.findSectionByName(Fragment.OutputSection);
   if (!Output) {
     Output = &G.createSection(Fragment.OutputSection, Input.getMemProt());
@@ -513,7 +541,13 @@ Error mergeFragmentSection(jitlink::LinkGraph &G,
   if (Inserted)
     llvm::append_range(Layout.Blocks, JITLinkLinker::orderedBlocks(*Output));
   Layout.Alignment = std::max(Layout.Alignment, Fragment.OutputAlignment);
-  llvm::append_range(Layout.Blocks, JITLinkLinker::orderedBlocks(Input));
+  auto Blocks = JITLinkLinker::orderedBlocks(Input);
+  if (Fragment.HasFallThrough) {
+    assert(!Blocks.empty() && Blocks.back()->getSize() >= 4 &&
+           "Missing emitted fall-through branch");
+    FallThroughBlocks.insert(Blocks.back());
+  }
+  llvm::append_range(Layout.Blocks, Blocks);
   G.mergeSections(*Output, Input);
   return Error::success();
 }
@@ -536,14 +570,9 @@ Error assignFragmentOrderKeys(jitlink::Section &Section,
     Offset = jitlink::alignToBlock(Offset, *Block);
     Block->setAddress(orc::ExecutorAddr(Offset));
     // These are ordering keys, not final addresses. Even empty marker blocks
-    // need distinct keys, and the existing reservation pass will insert a
-    // block at each source block's end. Leave room for those 20-byte slots.
+    // need distinct keys. The reservation pass assigns new keys to include
+    // the stub blocks.
     Offset += std::max<uint64_t>(1, Block->getSize());
-    uint64_t NumBranches = llvm::count_if(Block->edges(), [](const auto &E) {
-      return E.getKind() == jitlink::aarch64::Branch26PCRel;
-    });
-    if (NumBranches)
-      Offset = alignTo(Offset, 4) + 20 * NumBranches;
   }
   return Error::success();
 }
@@ -551,7 +580,8 @@ Error assignFragmentOrderKeys(jitlink::Section &Section,
 } // namespace
 
 Error JITLinkLinker::mergeFragmentSections(
-    jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments) {
+    jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments,
+    DenseSet<jitlink::Block *> &FallThroughBlocks) {
   outs() << "BOLT-INFO: begin of Fragment Sections merging.\n";
 
   FragmentSectionLayouts Layouts;
@@ -573,8 +603,8 @@ Error JITLinkLinker::mergeFragmentSections(
     return Err;
 
   for (auto [Index, Fragment] : llvm::enumerate(Fragments))
-    if (Error Err =
-            mergeFragmentSection(G, Fragment, *Sections[Index], Layouts))
+    if (Error Err = mergeFragmentSection(G, Fragment, *Sections[Index], Layouts,
+                                         FallThroughBlocks))
       return Err;
 
   for (auto &[Section, Layout] : Layouts)

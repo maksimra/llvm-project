@@ -79,6 +79,7 @@ struct EmittedFragmentSection {
   std::string Name;
   std::string OutputSection;
   uint64_t OutputAlignment;
+  /// The fragment ends with a fall-through guard to be retargeted by JITLink.
   bool HasFallThrough;
 };
 
