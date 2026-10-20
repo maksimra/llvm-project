@@ -462,10 +462,13 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 
   MCSymbol *EndSymbol = Function.getFunctionEndLabel(FF.getFragmentNum());
   if (HasFallThrough) {
-    // Keep the branch in the fragment's FDE with the final CFI state.
-    // JITLink will retarget it past the reserved stub space.
     MCInst Branch;
+    // Create branch with temporary target.
+    // JITLink will retarget it past the reserved stub space.
     BC.MIB->createUncondBranch(Branch, EndSymbol, BC.Ctx.get());
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: create 'fall through' guard "
+                      << "for " << StartSymbol->getName() << "\n");
+
     Streamer.emitInstruction(Branch, *BC.STI);
   }
 

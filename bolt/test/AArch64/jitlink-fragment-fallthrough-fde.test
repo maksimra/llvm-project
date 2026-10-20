@@ -1,0 +1,31 @@
+## The guard belongs to the source FDE and inherits its final CFI state.
+## Reserved stub space must remain outside that FDE.
+
+# REQUIRES: system-linux
+
+# RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux \
+# RUN:   %p/Inputs/jitlink-fragment-fallthrough.s -o %t.o
+# RUN: ld.lld --emit-relocs -e _start %t.o -o %t.exe
+# RUN: llvm-bolt %t.exe -o %t.bolt --turn-off-stubs --lite=0 --align-functions=16
+# RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=_start,last \
+# RUN:   %t.bolt > %t.dump
+# RUN: llvm-dwarfdump --eh-frame %t.bolt >> %t.dump
+# RUN: FileCheck %s --input-file=%t.dump
+
+## Locate the guards: the fourth instruction in _start and the second in last.
+# CHECK: [[#%x,START:]] <_start>:
+# CHECK-NEXT: sub sp, sp, #0x10
+# CHECK-NEXT: str x30, [sp, #0x8]
+# CHECK-NEXT: bl {{.*}} <callee>
+# CHECK-NEXT: {{0*}}[[#START + 12]]: b {{.*}} <continuation>
+# CHECK: [[#%x,LAST:]] <last>:
+# CHECK-NEXT: bl {{.*}} <callee>
+# CHECK-NEXT: {{0*}}[[#LAST + 4]]: b
+
+## The FDE ends immediately after the guard, before the reserved slot.
+## No later CFI row may change the CFA/LR rules before the guard executes.
+# CHECK: FDE cie={{.*}} pc={{0*}}[[#START]]...{{0*}}[[#START + 16]]
+# CHECK: 0x[[#START + 8]]: CFA=WSP+16: W30=[CFA-8]
+# CHECK-NOT: CFA=
+# CHECK: FDE cie=
+# CHECK: FDE cie={{.*}} pc={{0*}}[[#LAST]]...{{0*}}[[#LAST + 8]]

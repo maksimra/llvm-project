@@ -1,0 +1,38 @@
+## Inter-fragment b/bl relocations survive MC emission and are redirected
+## through stubs in JITLink. The fall-through guard skips the materialized stub.
+
+# REQUIRES: system-linux
+
+# RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux \
+# RUN:   %p/Inputs/jitlink-fragment-fallthrough.s -o %t.o
+# RUN: ld.lld --emit-relocs -e _start %t.o -o %t.exe
+## Move callee beyond the positive Branch26 limit (128 MiB), with a small margin.
+# RUN: llvm-bolt %t.exe -o %t.bolt --turn-off-stubs --lite=0 \
+# RUN:   --align-functions=16 --pad-funcs-before=callee:134217984 \
+# RUN:   --verify-branch26-range
+# RUN: llvm-objdump -d --no-show-raw-insn \
+# RUN:   --disassemble-symbols=_start,continuation %t.bolt | FileCheck %s
+
+## bl reaches the stub; the following guard jumps straight to continuation.
+## An ADRP/ADD/BR stub uses 12 of the 20 reserved bytes, leaving two NOPs.
+# CHECK-LABEL: <_start>:
+# CHECK-NEXT: sub sp, sp, #0x10
+# CHECK-NEXT: str x30, [sp, #0x8]
+# CHECK-NEXT: bl 0x[[#%x,CALL_STUB:]]
+# CHECK-NEXT: b {{.*}} <continuation>
+# CHECK-NEXT: {{0*}}[[#CALL_STUB]]: adrp x16,
+# CHECK-NEXT: add x16, x16,
+# CHECK-NEXT: br x16
+# CHECK-NEXT: nop
+# CHECK-NEXT: nop
+
+## An unconditional inter-fragment b is redirected through its own stub too.
+# CHECK-LABEL: <continuation>:
+# CHECK-NEXT: ldr x30, [sp, #0x8]
+# CHECK-NEXT: add sp, sp, #0x10
+# CHECK-NEXT: b 0x[[#%x,BRANCH_STUB:]]
+# CHECK-NEXT: {{0*}}[[#BRANCH_STUB]]: adrp x16,
+# CHECK-NEXT: add x16, x16,
+# CHECK-NEXT: br x16
+# CHECK-NEXT: nop
+# CHECK-NEXT: nop

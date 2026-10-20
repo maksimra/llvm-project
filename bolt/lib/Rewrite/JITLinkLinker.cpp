@@ -29,6 +29,11 @@ namespace bolt {
 
 namespace {
 
+[[maybe_unused]] std::string formatSignedHex(int64_t Value) {
+  const uint64_t Magnitude = Value < 0 ? -uint64_t(Value) : uint64_t(Value);
+  return ((Value < 0 ? "-0x" : "0x") + Twine::utohexstr(Magnitude)).str();
+}
+
 bool hasSymbols(const jitlink::Block &B) {
   return llvm::any_of(B.getSection().symbols(),
                       [&B](const auto &S) { return &S->getBlock() == &B; });
@@ -96,7 +101,6 @@ Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
     SlotBlock.addEdge(jitlink::aarch64::PageOffset12, SlotOffset + 4, Target,
                       Addend);
 
-    outs() << "BOLT-INFO: short jump stub was materialized.\n";
     // Leave the final eight bytes as reserved NOPs.
   } else {
     for (unsigned I = 0; I != 4; ++I) {
@@ -107,8 +111,12 @@ Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
       support::endian::write32le(Slot.data() + 4 * I, Instr);
     }
     support::endian::write32le(Slot.data() + 16, 0xd61f0200); // BR x16
-    outs() << "BOLT-INFO: long jump stub was materialized.\n";
   }
+  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: " << (UseADRP ? "short" : "long")
+                    << " jump stub was materialized at 0x"
+                    << Twine::utohexstr(SlotSym.getAddress().getValue())
+                    << ", target 0x"
+                    << Twine::utohexstr(TargetAddress.getValue()) << '\n');
   return Error::success();
 }
 
@@ -192,18 +200,21 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
         const auto TargetAddress =
             Edge.getTarget().getAddress() + Edge.getAddend();
         const int64_t Displacement = TargetAddress - SourceAddress;
-        outs() << "BOLT-INFO: edge for "
-               << (Edge.getTarget().hasName() ? *Edge.getTarget().getName()
-                                              : "<anonymous>")
-               << " has " << Displacement << " displacement.\n";
+        LLVM_DEBUG(dbgs() << "BOLT-DEBUG: edge for "
+                          << (Edge.getTarget().hasName()
+                                  ? *Edge.getTarget().getName()
+                                  : "<anonymous>")
+                          << " has " << formatSignedHex(Displacement)
+                          << " displacement.\n");
 
         if (isInt<28>(Displacement))
           continue;
 
         const int64_t SlotDisplacement = Record.SlotSym->getAddress() -
                                          SourceAddress;
-        outs() << "BOLT-INFO: that is out of range. And slot displacement is "
-               << SlotDisplacement << "\n";
+        LLVM_DEBUG(dbgs() << "BOLT-DEBUG: that is out of range. And slot "
+                             "displacement is "
+                          << formatSignedHex(SlotDisplacement) << "\n");
 
         if (!isInt<28>(SlotDisplacement))
           return make_error<jitlink::JITLinkError>(
@@ -258,10 +269,11 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
           if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
             continue;
 
-          outs() << "BOLT-INFO: reserve stub slot for "
-                 << (Edge.getTarget().hasName() ? *Edge.getTarget().getName()
-                                                : "<anonymous>")
-                 << "\n";
+          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: reserve stub slot for "
+                            << (Edge.getTarget().hasName()
+                                    ? *Edge.getTarget().getName()
+                                    : "<anonymous>")
+                            << "\n");
 
           Offsets.emplace_back(Edge.getOffset());
         }
@@ -272,8 +284,8 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
               Section, G.allocateBuffer(20 * Branch26Num),
               orc::ExecutorAddr(BlockOrder++), 4, 0);
 
-          outs() << "BOLT-INFO: created " << Branch26Num
-                 << " slots after block for stubs\n";
+          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: created " << Branch26Num
+                            << " slots after block for stubs\n");
 
           auto Content = StubBlock.getAlreadyMutableContent();
           for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
@@ -298,8 +310,8 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
 
   Error verifyAArch64Branch26Range(BinaryContext &BC,
                                    jitlink::LinkGraph &G) {
-    uint64_t Total = 0;
-    uint64_t OutOfRange = 0;
+    [[maybe_unused]] uint64_t Total = 0;
+    [[maybe_unused]] uint64_t OutOfRange = 0;
     for (jitlink::Section &Section : G.sections()) {
       for (jitlink::Block *Block : Section.blocks()) {
         for (const jitlink::Edge &Edge : Block->edges()) {
@@ -312,22 +324,24 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                                  Edge.getAddend();
           if (!isIntN(BC.MIB->getUncondBranchEncodingSize(), Displacement)) {
             ++OutOfRange;
-            outs() << "BOLT-WARNING: branch is out of range\n"
-                   << "edge at 0x"
-                   << Twine::utohexstr(Block->getFixupAddress(Edge).getValue())
-                   << " in " << Section.getName() << " targets 0x"
-                   << Twine::utohexstr(Edge.getTarget().getAddress().getValue())
-                   << " and addend is "
-                   << Twine::utohexstr(Edge.getAddend()) << "\n";
+            LLVM_DEBUG(dbgs() << "BOLT-DEBUG: branch is out of range\n"
+                              << "edge at 0x"
+                              << Twine::utohexstr(
+                                     Block->getFixupAddress(Edge).getValue())
+                              << " in " << Section.getName() << " targets 0x"
+                              << Twine::utohexstr(
+                                     Edge.getTarget().getAddress().getValue())
+                              << " and addend is "
+                              << Twine::utohexstr(Edge.getAddend()) << "\n");
           }
         }
       }
     }
 
-    outs() << "BOLT-INFO: " << Total << " branches detected before"
-              "fixups.\n";
-    outs() << "BOLT-INFO: " << OutOfRange << " branch destinations are "
-              "unreachable.\n";
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: " << Total
+                      << " branches detected before fixups.\n";
+               dbgs() << "BOLT-DEBUG: " << OutOfRange
+                      << " branch destinations are unreachable.\n");
 
     return Error::success();
   }
@@ -504,7 +518,7 @@ Error validateFragmentEdge(const jitlink::Block &Source,
 
 Error validateFragmentEdges(jitlink::LinkGraph &G,
                             const DenseSet<jitlink::Block *> &FragmentBlocks) {
-  outs() << "BOLT-INFO: Fragment Edges validation.\n";
+  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: Fragment Edges validation.\n");
 
   // S+A must stay in the original fragment. In particular, a section symbol
   // must not be reinterpreted as the start of the merged output section.
@@ -582,14 +596,15 @@ Error assignFragmentOrderKeys(jitlink::Section &Section,
 Error JITLinkLinker::mergeFragmentSections(
     jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments,
     DenseSet<jitlink::Block *> &FallThroughBlocks) {
-  outs() << "BOLT-INFO: begin of Fragment Sections merging.\n";
+  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: begin of Fragment Sections merging.\n");
 
   FragmentSectionLayouts Layouts;
   DenseSet<jitlink::Block *> FragmentBlocks;
   SmallVector<jitlink::Section *> Sections;
   for (const auto &Fragment : Fragments) {
-    outs() << "Fragment " << Fragment.Name << " and output section "
-           << Fragment.OutputSection << '\n';
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: Fragment " << Fragment.Name
+                      << " and output section " << Fragment.OutputSection
+                      << '\n');
     auto *Section = G.findSectionByName(Fragment.Name);
     if (!Section)
       return make_error<jitlink::JITLinkError>(
