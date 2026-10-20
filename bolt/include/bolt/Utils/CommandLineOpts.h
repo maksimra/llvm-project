@@ -92,6 +92,7 @@ extern llvm::cl::opt<unsigned> BucketsPerLine;
 extern llvm::cl::opt<bool> CompactCodeModel;
 extern llvm::cl::opt<bool> VerifyBranch26Range;
 extern llvm::cl::opt<bool> DoNotUseStubs;
+extern llvm::cl::opt<bool> PrintStubStats;
 extern llvm::cl::opt<bool> DiffOnly;
 extern llvm::cl::opt<bool> EnableBAT;
 extern llvm::cl::opt<bool> EqualizeBBCounts;

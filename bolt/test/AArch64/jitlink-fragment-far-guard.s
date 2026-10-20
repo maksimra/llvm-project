@@ -6,9 +6,11 @@
 # RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux %s -o %t.o
 # RUN: ld.lld --emit-relocs -e first %t.o -o %t.exe
 # RUN: llvm-bolt %t.exe -o %t.bolt --turn-off-stubs --lite=0 --split-functions \
-# RUN:   --align-functions=268435456 --verify-branch26-range
+# RUN:   --align-functions=268435456 --print-stub-stats --verify-branch26-range \
+# RUN:   | FileCheck %s --check-prefix=UNIQUE-STATS
 # RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=first,second \
 # RUN:   %t.bolt | FileCheck %s --check-prefixes=UNIQUE,CHECK
+# UNIQUE-STATS: BOLT-INFO: JITLink stubs: slots=1 unused=0 short-adrp=1 long-mov=0
 
 # CHECK-LABEL: <first>:
 # CHECK-NEXT: blr x0

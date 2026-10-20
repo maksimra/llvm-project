@@ -31,8 +31,19 @@
 # RUN: llvm-objdump -d --no-show-raw-insn --no-symbolize-operands \
 # RUN:   --section=.text.bolt.extra.1 %t.bolt | FileCheck %s
 
-# CHECK: b 0x[[DEST:[0-9a-f]+]]
-# CHECK: {{^ *0*}}[[DEST]]:{{.*}}ret
+## Deferred relaxation applies only to the main object. The runtime must have
+## the same block layout, and its branch must not reserve an extra stub slot.
+# RUN: llvm-bolt %t.exe -o %t.deferred.bolt --lite=0 --hugify \
+# RUN:   --turn-off-stubs --print-stub-stats --runtime-hugify-lib=%t.runtime.o \
+# RUN:   | FileCheck %s --check-prefix=STATS
+# RUN: llvm-objdump -d --no-show-raw-insn --no-symbolize-operands \
+# RUN:   --section=.text.bolt.extra.1 %t.deferred.bolt | FileCheck %s
+
+# STATS: BOLT-INFO: JITLink stubs: slots=1 unused=1 short-adrp=0 long-mov=0
+# STATS-NOT: BOLT-INFO: JITLink stubs:
+# CHECK: [[#%x,BRANCH:]]:{{[ \t]+}}b
+# CHECK-SAME: 0x[[#BRANCH + 16]]
+# CHECK: {{^ *0*}}[[#BRANCH + 16]]:{{.*}}ret
 
 .ifdef MAIN
   .text

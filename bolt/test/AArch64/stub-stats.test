@@ -1,0 +1,62 @@
+## Stub statistics are opt-in and describe the main BOLT-emitted object.
+## Fall-through guards participate in reservation and relaxation too.
+
+# REQUIRES: system-linux
+
+# RUN: split-file %s %t
+# RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux \
+# RUN:   %p/Inputs/jitlink-fragment-fallthrough.s -o %t.o
+# RUN: ld.lld --emit-relocs -e _start %t.o -o %t.exe
+
+## All three original branches and all three guards fit; all six reserved
+## slots stay unused.
+# RUN: llvm-bolt %t.exe -o %t.near --lite=0 --turn-off-stubs \
+# RUN:   --print-stub-stats | FileCheck %s --check-prefix=NEAR
+# NEAR: BOLT-INFO: JITLink stubs: slots=6 unused=6 short-adrp=0 long-mov=0
+
+## Moving callee out of range materializes two call/branch slots. All
+## three guard reservations remain unused.
+# RUN: llvm-bolt %t.exe -o %t.far --lite=0 --turn-off-stubs \
+# RUN:   --pad-funcs-before=callee:134217984 --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=FAR
+# FAR: BOLT-INFO: JITLink stubs: slots=6 unused=4 short-adrp=2 long-mov=0
+
+## Runtime objects bypass deferred relaxation. A far Branch26 in a custom
+## runtime is rejected by the normal JITLink fixup instead of creating a stub.
+# RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux \
+# RUN:   %t/runtime.s -o %t.runtime.o
+# RUN: not llvm-bolt %t.exe -o %t.runtime --lite=0 --turn-off-stubs --hugify \
+# RUN:   --runtime-hugify-lib=%t.runtime.o --print-stub-stats \
+# RUN:   2>&1 | FileCheck %s --check-prefix=RUNTIME
+# RUNTIME: BOLT-INFO: JITLink stubs: slots=6 unused=6 short-adrp=0 long-mov=0
+# RUNTIME-NOT: BOLT-INFO: JITLink stubs:
+# RUNTIME: BOLT-ERROR: JITLink failed: {{.*}} is out of range of Branch26PCRel fixup
+
+## The other modes create no stubs for this small input.
+# RUN: llvm-bolt %t.exe -o %t.classic --lite=0 --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=CLASSIC
+# CLASSIC: BOLT-INFO: LongJmp stubs: total=0 direct-b=0 short-adrp=0 long-mov=0
+# RUN: llvm-bolt %t.exe -o %t.exp --lite=0 --relax-exp --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=EXP
+# EXP: BOLT-INFO: relax-exp stubs: total=0 direct-b=0 short-adrp=0 long-mov=0
+
+# RUN: llvm-bolt %t.exe -o %t.quiet --lite=0 --turn-off-stubs \
+# RUN:   | FileCheck %s --check-prefix=QUIET
+# RUN: llvm-bolt %t.exe -o %t.classic.quiet --lite=0 \
+# RUN:   | FileCheck %s --check-prefix=QUIET
+# RUN: llvm-bolt %t.exe -o %t.exp.quiet --lite=0 --relax-exp \
+# RUN:   | FileCheck %s --check-prefix=QUIET
+# QUIET-NOT: stubs:
+# QUIET: BOLT-INFO:
+# QUIET-NOT: stubs:
+
+#--- runtime.s
+.text
+.globl __bolt_hugify_self
+.type __bolt_hugify_self, %function
+__bolt_hugify_self:
+  .inst 0x14000000
+  .reloc .-4, R_AARCH64_JUMP26, far_target
+.size __bolt_hugify_self, .-__bolt_hugify_self
+.globl far_target
+.set far_target, 0x1234567890

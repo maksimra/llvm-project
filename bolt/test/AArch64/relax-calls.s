@@ -12,6 +12,9 @@
 # RUN:   | FileCheck %s --check-prefix=CHECK-BOLT
 # RUN: llvm-bolt %t.exe -o %t.bolt --relax-exp --hot-functions-at-end --lite=0 \
 # RUN:   --data %t.fdata | FileCheck %s --check-prefix=CHECK-BOLT-HOT-END
+# RUN: llvm-bolt %t.exe -o %t.classic.bolt --relax-exp=0 --lite=0 \
+# RUN:   --data %t.fdata --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=CLASSIC-STATS
 # RUN: llvm-objdump -d %t.bolt | FileCheck %s --check-prefix=CHECK-OUTPUT
 
 ## Constant islands at the end of functions foo(), bar(), and _start() make each
@@ -63,6 +66,8 @@ hot:
 # CHECK-BOLT-HOT-END: BOLT-INFO: relaxed 1 calls with long thunks
 # CHECK-BOLT-HOT-END: BOLT-INFO: 3 short thunks created
 # CHECK-BOLT-HOT-END: BOLT-INFO: 1 long thunks created
+
+# CLASSIC-STATS: BOLT-INFO: LongJmp stubs: total=3 direct-b=0 short-adrp=3 long-mov=0
 
 ## Check that correct veneers are used depending on the target proximity.
 # CHECK-OUTPUT-LABEL: <hot>:

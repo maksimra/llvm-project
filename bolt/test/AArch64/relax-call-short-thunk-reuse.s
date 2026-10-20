@@ -16,7 +16,7 @@
 # RUN: llvm-strip --strip-unneeded %t
 # RUN: llvm-bolt %t -o %t.bolt --data %t.fdata --relax-exp \
 # RUN:   --max-cluster-size=160 --max-thunk-chain-length=3 \
-# RUN:   | FileCheck %s --check-prefix=CHECK-BOLT
+# RUN:   --print-stub-stats | FileCheck %s --check-prefix=CHECK-BOLT
 # RUN: llvm-objdump -d \
 # RUN:   --disassemble-symbols=A,B,C,D,E,F,__AArch64_forward_Thunk_F_0,__AArch64_forward_Thunk_F_1,__AArch64_forward_Thunk_F_2 \
 # RUN:   %t.bolt | FileCheck %s --check-prefix=CHECK-OUTPUT
@@ -25,6 +25,7 @@
 # CHECK-BOLT: BOLT-INFO: relaxed 4 calls with short thunks
 # CHECK-BOLT: BOLT-INFO: 3 short thunks created
 # CHECK-BOLT: BOLT-INFO: 6 short thunks reused
+# CHECK-BOLT: BOLT-INFO: relax-exp stubs: total=3 direct-b=3 short-adrp=0 long-mov=0
 
 ## The reuse counter is per reused chain rung:
 ##

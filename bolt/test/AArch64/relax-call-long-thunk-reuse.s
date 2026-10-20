@@ -21,7 +21,7 @@
 # RUN: llvm-strip --strip-unneeded %t
 # RUN: llvm-bolt %t -o %t.bolt --data %t.fdata --relax-exp \
 # RUN:   --max-cluster-size=64 --max-thunk-chain-length=0 \
-# RUN:   | FileCheck %s --check-prefix=CHECK-BOLT
+# RUN:   --print-stub-stats | FileCheck %s --check-prefix=CHECK-BOLT
 # RUN: llvm-objdump -d \
 # RUN:   --disassemble-symbols=A,B,C,D,E,__AArch64_backward_ADRPThunk_A_0,__AArch64_backward_ADRPThunk_A_1 \
 # RUN:   %t.bolt | FileCheck %s --check-prefix=CHECK-OUTPUT
@@ -30,6 +30,7 @@
 # CHECK-BOLT: BOLT-INFO: relaxed 3 calls with long thunks
 # CHECK-BOLT: BOLT-INFO: 2 long thunks created
 # CHECK-BOLT: BOLT-INFO: 1 long thunks reused
+# CHECK-BOLT: BOLT-INFO: relax-exp stubs: total=2 direct-b=0 short-adrp=2 long-mov=0
 
   .text
   .globl A

@@ -73,9 +73,11 @@ void reassignSectionAddress(jitlink::LinkGraph &LG,
   JITLinkLinker::assignBlockAddresses(*JLSection, Address);
 }
 
-Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
-                            jitlink::Edge::AddendT Addend,
-                            bool HasFixedLoadAddress) {
+/// Return true for a short (ADRP) stub and false for a long (MOV) stub.
+Expected<bool> materializeAArch64Stub(jitlink::Symbol &SlotSym,
+                                      jitlink::Symbol &Target,
+                                      jitlink::Edge::AddendT Addend,
+                                      bool HasFixedLoadAddress) {
   const auto TargetAddress = Target.getAddress() + Addend;
 
   const int64_t PageDelta =
@@ -117,7 +119,7 @@ Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
                     << Twine::utohexstr(SlotSym.getAddress().getValue())
                     << ", target 0x"
                     << Twine::utohexstr(TargetAddress.getValue()) << '\n');
-  return Error::success();
+  return UseADRP;
 }
 
 } // anonymous namespace
@@ -154,18 +156,19 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                          jitlink::PassConfiguration &Config) override {
     Config.PrePrunePasses.push_back(markSectionsLive);
 
-    if (opts::DoNotUseStubs && G.getTargetTriple().isAArch64()) {
-      if (Linker.BC.isELF() && !Linker.MM->ObjectsLoaded) {
-        Config.PostPrunePasses.push_back([this](auto &G) {
-          return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections,
-                                       FallThroughBlocks);
-        });
-      }
+    // Only the main ELF object has BOLT's fragment sections and fall-through
+    // guards. Runtime objects must retain their original block layout.
+    if (opts::DoNotUseStubs && G.getTargetTriple().isAArch64() &&
+        Linker.BC.isELF() && !Linker.MM->ObjectsLoaded) {
       Config.PostPrunePasses.push_back([this](auto &G) {
-        return addThunkSpace(G); });
+        return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections,
+                                     FallThroughBlocks);
+      });
+      Config.PostPrunePasses.push_back(
+          [this](auto &G) { return addThunkSpace(G); });
 
-      Config.PreFixupPasses.push_back([this](auto &G) {
-        return repairEdges(G); });
+      Config.PreFixupPasses.push_back(
+          [this](auto &G) { return repairEdges(G); });
     }
 
     Config.PostAllocationPasses.push_back([this](auto &G) {
@@ -190,6 +193,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   }
 
   Error repairEdges(jitlink::LinkGraph &G) {
+    uint64_t NumShortStubs = 0, NumLongStubs = 0;
     for (auto &Record : StubRecords) {
       for (jitlink::Edge &Edge :
            Record.SourceBlock->edges_at(Record.SourceOffset)) {
@@ -220,15 +224,27 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
           return make_error<jitlink::JITLinkError>(
               "Reserved AArch64 branch stub is out of Branch26 range");
 
-        if (Error Err = materializeAArch64Stub(
-                *Record.SlotSym, Edge.getTarget(), Edge.getAddend(),
-                Linker.BC.HasFixedLoadAddress))
-          return Err;
+        auto IsShort = materializeAArch64Stub(*Record.SlotSym, Edge.getTarget(),
+                                              Edge.getAddend(),
+                                              Linker.BC.HasFixedLoadAddress);
+        if (!IsShort)
+          return IsShort.takeError();
+        if (*IsShort)
+          ++NumShortStubs;
+        else
+          ++NumLongStubs;
 
         Edge.setTarget(*Record.SlotSym);
         Edge.setAddend(0);
       }
     }
+
+    if (opts::PrintStubStats)
+      Linker.BC.outs() << "BOLT-INFO: JITLink stubs: slots="
+                       << StubRecords.size() << " unused="
+                       << StubRecords.size() - NumShortStubs - NumLongStubs
+                       << " short-adrp=" << NumShortStubs
+                       << " long-mov=" << NumLongStubs << '\n';
 
     return Error::success();
   }

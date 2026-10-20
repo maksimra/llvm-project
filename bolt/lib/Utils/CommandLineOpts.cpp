@@ -119,6 +119,11 @@ cl::opt<bool> DoNotUseStubs(
     cl::desc("don't relax inter-function branches and calls"),
     cl::init(false), cl::Hidden, cl::cat(BoltCategory));
 
+cl::opt<bool> PrintStubStats(
+    "print-stub-stats",
+    cl::desc("print AArch64 stub statistics (short=ADRP, long=MOV)"),
+    cl::cat(BoltCategory));
+
 cl::opt<bool>
 DiffOnly("diff-only",
   cl::desc("stop processing once we have enough to compare two binaries"),

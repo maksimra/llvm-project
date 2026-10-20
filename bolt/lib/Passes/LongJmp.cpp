@@ -1374,6 +1374,15 @@ void ClusteredRelaxation::printStats() const {
   if (NumBranchThunksReused)
     BC.outs() << "BOLT-INFO: " << NumBranchThunksReused
               << " branch thunks reused\n";
+
+  if (opts::PrintStubStats) {
+    // Both call and branch chains consist of direct B thunks. The thunks
+    // called "long" by this pass use ADRP, rather than absolute MOV sequences.
+    const size_t NumDirect = NumShortThunks + NumBranchThunks;
+    BC.outs() << "BOLT-INFO: relax-exp stubs: total="
+              << NumDirect + NumLongThunks << " direct-b=" << NumDirect
+              << " short-adrp=" << NumLongThunks << " long-mov=0\n";
+  }
 }
 
 void ClusteredRelaxation::collectOutOfRangeReferences() {
@@ -1850,6 +1859,21 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
             << " stubs in the hot area and " << NumColdStubs
             << " stubs in the cold area. Shared " << NumSharedStubs
             << " times, iterated " << Iterations << " times.\n";
+  if (opts::PrintStubStats) {
+    uint64_t NumDirect = 0, NumShort = 0, NumLong = 0;
+    // Count final forms, not the number of expansions during relaxation.
+    for (const auto &[Stub, Bits] : StubBits) {
+      if (Bits == BC.MIB->getUncondBranchEncodingSize())
+        ++NumDirect;
+      else if (Bits == BC.MIB->getShortJmpEncodingSize())
+        ++NumShort;
+      else
+        ++NumLong;
+    }
+    BC.outs() << "BOLT-INFO: LongJmp stubs: total=" << StubBits.size()
+              << " direct-b=" << NumDirect << " short-adrp=" << NumShort
+              << " long-mov=" << NumLong << '\n';
+  }
   return Error::success();
 }
 } // namespace bolt
