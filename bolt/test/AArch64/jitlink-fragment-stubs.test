@@ -26,13 +26,9 @@
 # CHECK-NEXT: nop
 # CHECK-NEXT: nop
 
-## An unconditional inter-fragment b is redirected through its own stub too.
+## An unconditional inter-fragment b reuses the call's stub. No second slot is
+## reserved after continuation.
 # CHECK-LABEL: <continuation>:
 # CHECK-NEXT: ldr x30, [sp, #0x8]
 # CHECK-NEXT: add sp, sp, #0x10
-# CHECK-NEXT: b 0x[[#%x,BRANCH_STUB:]]
-# CHECK-NEXT: {{0*}}[[#BRANCH_STUB]]: adrp x16,
-# CHECK-NEXT: add x16, x16,
-# CHECK-NEXT: br x16
-# CHECK-NEXT: nop
-# CHECK-NEXT: nop
+# CHECK-NEXT: b 0x[[#CALL_STUB]]

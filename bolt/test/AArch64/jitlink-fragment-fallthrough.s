@@ -29,8 +29,9 @@
 # CHECK-NEXT: b 0x[[#%x,LAST:]] <last>
 # CHECK-COUNT-5: nop
 
-## At section end, the guard skips the call and guard reservations.
+## last shares the earlier callee reservation. Its guard's continuation stays
+## after its own reserved slot at section end.
 # CHECK: {{0*}}[[#LAST]] <last>:
 # CHECK-NEXT: bl {{.*}} <callee>
-# CHECK-NEXT: b 0x[[#LAST + 48]]
-# CHECK-COUNT-10: nop
+# CHECK-NEXT: b 0x[[#LAST + 28]]
+# CHECK-COUNT-5: nop

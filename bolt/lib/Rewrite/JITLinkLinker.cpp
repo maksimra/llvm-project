@@ -11,6 +11,7 @@
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
 #include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
@@ -32,6 +33,16 @@ namespace {
 [[maybe_unused]] std::string formatSignedHex(int64_t Value) {
   const uint64_t Magnitude = Value < 0 ? -uint64_t(Value) : uint64_t(Value);
   return ((Value < 0 ? "-0x" : "0x") + Twine::utohexstr(Magnitude)).str();
+}
+
+/// Target's {Addressable + Offset}
+using AArch64StubTarget = std::pair<const jitlink::Addressable *, uint64_t>;
+
+AArch64StubTarget getAArch64StubTarget(const jitlink::Edge &Edge) {
+  const auto &Target = Edge.getTarget();
+  if (Target.isAbsolute())
+    return {nullptr, (Target.getAddress() + Edge.getAddend()).getValue()};
+  return {&Target.getAddressable(), Target.getOffset() + Edge.getAddend()};
 }
 
 bool hasSymbols(const jitlink::Block &B) {
@@ -128,10 +139,13 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   JITLinkLinker &Linker;
   JITLinkLinker::SectionsMapper MapSections;
 
-  struct StubRecord {
+  struct BranchRecord {
     jitlink::Block *SourceBlock;
     jitlink::Edge::OffsetT SourceOffset;
-    jitlink::Symbol *SlotSym;
+  };
+  struct StubRecord {
+    jitlink::Symbol *SlotSym = nullptr;
+    SmallVector<BranchRecord, 1> Branches;
   };
   std::vector<StubRecord> StubRecords;
   DenseSet<jitlink::Block *> FallThroughBlocks;
@@ -193,49 +207,65 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   }
 
   Error repairEdges(jitlink::LinkGraph &G) {
-    uint64_t NumShortStubs = 0, NumLongStubs = 0;
+    uint64_t NumShortStubs = 0, NumLongStubs = 0, NumSharedStubs = 0;
+
+    DenseMap<uint64_t, SmallVector<jitlink::Symbol *, 1>> MaterializedStubs;
     for (auto &Record : StubRecords) {
-      for (jitlink::Edge &Edge :
-           Record.SourceBlock->edges_at(Record.SourceOffset)) {
-        if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
-          continue;
+      for (const auto &Branch : Record.Branches) {
+        for (jitlink::Edge &Edge :
+             Branch.SourceBlock->edges_at(Branch.SourceOffset)) {
+          if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
+            continue;
 
-        const auto SourceAddress = Record.SourceBlock->getFixupAddress(Edge);
-        const auto TargetAddress =
-            Edge.getTarget().getAddress() + Edge.getAddend();
-        const int64_t Displacement = TargetAddress - SourceAddress;
-        LLVM_DEBUG(dbgs() << "BOLT-DEBUG: edge for "
-                          << (Edge.getTarget().hasName()
-                                  ? *Edge.getTarget().getName()
-                                  : "<anonymous>")
-                          << " has " << formatSignedHex(Displacement)
-                          << " displacement.\n");
+          const auto SourceAddress = Branch.SourceBlock->getFixupAddress(Edge);
+          const auto TargetAddress =
+              Edge.getTarget().getAddress() + Edge.getAddend();
+          const int64_t Displacement = TargetAddress - SourceAddress;
+          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: edge for "
+                            << (Edge.getTarget().hasName()
+                                    ? *Edge.getTarget().getName()
+                                    : "<anonymous>")
+                            << " has " << formatSignedHex(Displacement)
+                            << " displacement.\n");
 
-        if (isInt<28>(Displacement))
-          continue;
+          if (isInt<28>(Displacement))
+            continue;
 
-        const int64_t SlotDisplacement = Record.SlotSym->getAddress() -
-                                         SourceAddress;
-        LLVM_DEBUG(dbgs() << "BOLT-DEBUG: that is out of range. And slot "
-                             "displacement is "
-                          << formatSignedHex(SlotDisplacement) << "\n");
+          auto &Stubs = MaterializedStubs[TargetAddress.getValue()];
+          auto It = llvm::find_if(llvm::reverse(Stubs), [&](const auto *Stub) {
+            return isInt<28>(int64_t(Stub->getAddress() - SourceAddress));
+          });
+          if (It != Stubs.rend()) {
+            Edge.setTarget(**It);
+            Edge.setAddend(0);
+            ++NumSharedStubs;
+            continue;
+          }
 
-        if (!isInt<28>(SlotDisplacement))
-          return make_error<jitlink::JITLinkError>(
-              "Reserved AArch64 branch stub is out of Branch26 range");
+          const int64_t SlotDisplacement =
+              Record.SlotSym->getAddress() - SourceAddress;
+          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: that is out of range. And slot "
+                               "displacement is "
+                            << formatSignedHex(SlotDisplacement) << "\n");
 
-        auto IsShort = materializeAArch64Stub(*Record.SlotSym, Edge.getTarget(),
-                                              Edge.getAddend(),
-                                              Linker.BC.HasFixedLoadAddress);
-        if (!IsShort)
-          return IsShort.takeError();
-        if (*IsShort)
-          ++NumShortStubs;
-        else
-          ++NumLongStubs;
+          if (!isInt<28>(SlotDisplacement))
+            return make_error<jitlink::JITLinkError>(
+                "Reserved AArch64 branch stub is out of Branch26 range");
 
-        Edge.setTarget(*Record.SlotSym);
-        Edge.setAddend(0);
+          auto IsShort = materializeAArch64Stub(
+              *Record.SlotSym, Edge.getTarget(), Edge.getAddend(),
+              Linker.BC.HasFixedLoadAddress);
+          if (!IsShort)
+            return IsShort.takeError();
+          if (*IsShort)
+            ++NumShortStubs;
+          else
+            ++NumLongStubs;
+          Stubs.push_back(Record.SlotSym);
+
+          Edge.setTarget(*Record.SlotSym);
+          Edge.setAddend(0);
+        }
       }
     }
 
@@ -244,23 +274,33 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                        << StubRecords.size() << " unused="
                        << StubRecords.size() - NumShortStubs - NumLongStubs
                        << " short-adrp=" << NumShortStubs
-                       << " long-mov=" << NumLongStubs << '\n';
+                       << " long-mov=" << NumLongStubs
+                       << " shared=" << NumSharedStubs << '\n';
 
     return Error::success();
   }
 
   Error addThunkSpace(jitlink::LinkGraph &G) {
+    struct ReservedStub {
+      size_t RecordIndex;
+      uint64_t SectionOffset;
+    };
     for (jitlink::Section &Section : G.sections()) {
+      // Only share reservations within a section: its base is not known yet,
+      // but the memory manager's section-relative packing is already fixed.
+      DenseMap<AArch64StubTarget, ReservedStub> SharedStubs;
       auto Blocks = JITLinkLinker::orderedBlocks(Section);
+      uint64_t SectionOffset = 0;
       uint64_t BlockOrder = 0;
       for (auto [Index, Block] : llvm::enumerate(Blocks)) {
-        // Addresses remain ordering keys until allocation. Include
-        // source blocks, stub blocks and the one-past end marker.
+        SectionOffset = jitlink::alignToBlock(SectionOffset, *Block);
+        // Addresses remain ordering keys until allocation. Give every block
+        // a distinct key, including empty markers and new stub blocks.
         Block->setAddress(orc::ExecutorAddr(BlockOrder++));
         jitlink::Block *EndMarker = nullptr;
         if (FallThroughBlocks.contains(Block)) {
-          // Install the guard before collecting branches so it receives a stub
-          // reservation and is relaxed using the final layout too.
+          // Install the guard before collecting branches so it participates in
+          // reservation sharing and is relaxed using the final layout too.
           jitlink::Block *ContinuationBlock;
           if (Index + 1 < Blocks.size()) {
             // Skip the next block's alignment padding as well as our stubs.
@@ -280,27 +320,38 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
           Block->addEdge(jitlink::aarch64::Branch26PCRel, BranchOffset,
                          Continuation, 0);
         }
-        std::vector<jitlink::Edge::OffsetT> Offsets;
+        const uint64_t StubBlockOffset =
+            alignTo(SectionOffset + Block->getSize(), 4);
+        const size_t FirstNewStub = StubRecords.size();
         for (const jitlink::Edge &Edge : Block->edges()) {
           if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
             continue;
 
-          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: reserve stub slot for "
-                            << (Edge.getTarget().hasName()
-                                    ? *Edge.getTarget().getName()
-                                    : "<anonymous>")
-                            << "\n");
-
-          Offsets.emplace_back(Edge.getOffset());
+          const auto Target = getAArch64StubTarget(Edge);
+          auto It = SharedStubs.find(Target);
+          const uint64_t SourceOffset = SectionOffset + Edge.getOffset();
+          if (It == SharedStubs.end() ||
+              !isInt<28>(int64_t(It->second.SectionOffset - SourceOffset))) {
+            const uint64_t SlotOffset =
+                StubBlockOffset + 20 * (StubRecords.size() - FirstNewStub);
+            It = SharedStubs
+                     .insert_or_assign(
+                         Target, ReservedStub{StubRecords.size(), SlotOffset})
+                     .first;
+            StubRecords.emplace_back();
+          }
+          StubRecords[It->second.RecordIndex].Branches.push_back(
+              {Block, Edge.getOffset()});
         }
 
-        uint64_t Branch26Num = Offsets.size();
-        if (Branch26Num) {
+        const uint64_t NumNewStubs = StubRecords.size() - FirstNewStub;
+        SectionOffset += Block->getSize();
+        if (NumNewStubs) {
           jitlink::Block &StubBlock = G.createMutableContentBlock(
-              Section, G.allocateBuffer(20 * Branch26Num),
+              Section, G.allocateBuffer(20 * NumNewStubs),
               orc::ExecutorAddr(BlockOrder++), 4, 0);
 
-          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: created " << Branch26Num
+          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: created " << NumNewStubs
                             << " slots after block for stubs\n");
 
           auto Content = StubBlock.getAlreadyMutableContent();
@@ -308,12 +359,11 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
             support::endian::write32le(Content.data() + Offset,
                                        0xd503201f); // NOP
 
-          for (uint64_t SymbolNum = 0; SymbolNum < Branch26Num; ++SymbolNum) {
-            StubRecords.push_back(
-                StubRecord{Block, Offsets[SymbolNum],
-                           &G.addAnonymousSymbol(StubBlock, 20 * SymbolNum, 20,
-                                                 true, true)});
-          }
+          for (uint64_t SymbolNum = 0; SymbolNum < NumNewStubs; ++SymbolNum)
+            StubRecords[FirstNewStub + SymbolNum].SlotSym =
+                &G.addAnonymousSymbol(StubBlock, 20 * SymbolNum, 20, true,
+                                      true);
+          SectionOffset = StubBlockOffset + StubBlock.getSize();
         }
 
         if (EndMarker)
@@ -601,7 +651,7 @@ Error assignFragmentOrderKeys(jitlink::Section &Section,
     Block->setAddress(orc::ExecutorAddr(Offset));
     // These are ordering keys, not final addresses. Even empty marker blocks
     // need distinct keys. The reservation pass assigns new keys to include
-    // the stub blocks.
+    // the shared stub blocks.
     Offset += std::max<uint64_t>(1, Block->getSize());
   }
   return Error::success();

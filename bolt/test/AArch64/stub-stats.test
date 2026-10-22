@@ -8,18 +8,19 @@
 # RUN:   %p/Inputs/jitlink-fragment-fallthrough.s -o %t.o
 # RUN: ld.lld --emit-relocs -e _start %t.o -o %t.exe
 
-## All three original branches and all three guards fit; all six reserved
-## slots stay unused.
+## All three original branches fit and share one unused reservation. The
+## three fall-through guards each reserve an unused slot too.
 # RUN: llvm-bolt %t.exe -o %t.near --lite=0 --turn-off-stubs \
 # RUN:   --print-stub-stats | FileCheck %s --check-prefix=NEAR
-# NEAR: BOLT-INFO: JITLink stubs: slots=6 unused=6 short-adrp=0 long-mov=0
+# NEAR: BOLT-INFO: JITLink stubs: slots=4 unused=4 short-adrp=0 long-mov=0 shared=0
 
-## Moving callee out of range materializes two call/branch slots. All
+## The first two branches share one materialized stub. last needs a separate
+## reservation beyond the padding, but its original branch still fits. All
 ## three guard reservations remain unused.
 # RUN: llvm-bolt %t.exe -o %t.far --lite=0 --turn-off-stubs \
 # RUN:   --pad-funcs-before=callee:134217984 --print-stub-stats \
 # RUN:   | FileCheck %s --check-prefix=FAR
-# FAR: BOLT-INFO: JITLink stubs: slots=6 unused=4 short-adrp=2 long-mov=0
+# FAR: BOLT-INFO: JITLink stubs: slots=5 unused=4 short-adrp=1 long-mov=0 shared=1
 
 ## Runtime objects bypass deferred relaxation. A far Branch26 in a custom
 ## runtime is rejected by the normal JITLink fixup instead of creating a stub.
@@ -28,7 +29,7 @@
 # RUN: not llvm-bolt %t.exe -o %t.runtime --lite=0 --turn-off-stubs --hugify \
 # RUN:   --runtime-hugify-lib=%t.runtime.o --print-stub-stats \
 # RUN:   2>&1 | FileCheck %s --check-prefix=RUNTIME
-# RUNTIME: BOLT-INFO: JITLink stubs: slots=6 unused=6 short-adrp=0 long-mov=0
+# RUNTIME: BOLT-INFO: JITLink stubs: slots=4 unused=4 short-adrp=0 long-mov=0 shared=0
 # RUNTIME-NOT: BOLT-INFO: JITLink stubs:
 # RUNTIME: BOLT-ERROR: JITLink failed: {{.*}} is out of range of Branch26PCRel fixup
 
