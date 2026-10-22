@@ -12,7 +12,6 @@
 #include "bolt/Core/BinarySection.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/MapVector.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/JITLink/aarch64.h"
@@ -60,7 +59,8 @@ Error markSectionsLive(jitlink::LinkGraph &G) {
       continue;
 
     // Skip empty sections.
-    if (JITLinkLinker::sectionSize(Section) == 0)
+    if (llvm::none_of(Section.blocks(),
+                      [](const auto *Block) { return Block->getSize() != 0; }))
       continue;
 
     for (auto *Block : Section.blocks()) {
@@ -81,7 +81,8 @@ void reassignSectionAddress(jitlink::LinkGraph &LG,
   auto *JLSection = LG.findSectionByName(BinSection.getSectionID());
   assert(JLSection && "cannot find section in LinkGraph");
 
-  JITLinkLinker::assignBlockAddresses(*JLSection, Address);
+  JITLinkLinker::assignBlockAddresses(
+      *JLSection, BinSection.getOutputContents().data(), Address);
 }
 
 /// Return true for a short (ADRP) stub and false for a long (MOV) stub.
@@ -139,16 +140,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   JITLinkLinker &Linker;
   JITLinkLinker::SectionsMapper MapSections;
 
-  struct BranchRecord {
-    jitlink::Block *SourceBlock;
-    jitlink::Edge::OffsetT SourceOffset;
-  };
-  struct StubRecord {
-    jitlink::Symbol *SlotSym = nullptr;
-    SmallVector<BranchRecord, 1> Branches;
-  };
-  std::vector<StubRecord> StubRecords;
-  DenseSet<jitlink::Block *> FallThroughBlocks;
+  std::vector<AArch64Stub> StubRecords;
 
   Context(JITLinkLinker &Linker, JITLinkLinker::SectionsMapper MapSections)
       : JITLinkContext(&Linker.Dylib), Linker(Linker),
@@ -172,18 +164,33 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
 
     // Only the main ELF object has BOLT's fragment sections and fall-through
     // guards. Runtime objects must retain their original block layout.
-    if (opts::DoNotUseStubs && G.getTargetTriple().isAArch64() &&
-        Linker.BC.isELF() && !Linker.MM->ObjectsLoaded) {
-      Config.PostPrunePasses.push_back([this](auto &G) {
-        return mergeFragmentSections(G, Linker.BC.EmittedFragmentSections,
-                                     FallThroughBlocks);
-      });
-      Config.PostPrunePasses.push_back(
-          [this](auto &G) { return addThunkSpace(G); });
+    const bool DeferredStubs = opts::DoNotUseStubs &&
+                               G.getTargetTriple().isAArch64() &&
+                               Linker.BC.isELF() && !Linker.MM->ObjectsLoaded;
+    Config.PostPrunePasses.push_back([this, DeferredStubs](auto &G) -> Error {
+      if (DeferredStubs) {
+        DenseSet<jitlink::Block *> FallThroughBlocks;
+        if (Error Err = mergeFragmentSections(
+                G, Linker.BC.EmittedFragmentSections, FallThroughBlocks))
+          return Err;
+        auto Stubs =
+            reserveAArch64Stubs(G, FallThroughBlocks, &Linker.BC.outs());
+        if (!Stubs)
+          return Stubs.takeError();
+        StubRecords = std::move(*Stubs);
+      }
 
+      // Allocation copies these final section-relative placements verbatim.
+      for (auto &Section : G.sections())
+        if (!DeferredStubs ||
+            (Section.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None)
+          layoutBlocks(orderedBlocks(Section));
+      return Error::success();
+    });
+
+    if (DeferredStubs)
       Config.PreFixupPasses.push_back(
           [this](auto &G) { return repairEdges(G); });
-    }
 
     Config.PostAllocationPasses.push_back([this](auto &G) {
       MapSections([&G](const BinarySection &Section, uint64_t Address) {
@@ -276,100 +283,6 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                        << " short-adrp=" << NumShortStubs
                        << " long-mov=" << NumLongStubs
                        << " shared=" << NumSharedStubs << '\n';
-
-    return Error::success();
-  }
-
-  Error addThunkSpace(jitlink::LinkGraph &G) {
-    struct ReservedStub {
-      size_t RecordIndex;
-      uint64_t SectionOffset;
-    };
-    for (jitlink::Section &Section : G.sections()) {
-      // Only share reservations within a section: its base is not known yet,
-      // but the memory manager's section-relative packing is already fixed.
-      DenseMap<AArch64StubTarget, ReservedStub> SharedStubs;
-      auto Blocks = JITLinkLinker::orderedBlocks(Section);
-      uint64_t SectionOffset = 0;
-      uint64_t BlockOrder = 0;
-      for (auto [Index, Block] : llvm::enumerate(Blocks)) {
-        SectionOffset = jitlink::alignToBlock(SectionOffset, *Block);
-        // Addresses remain ordering keys until allocation. Give every block
-        // a distinct key, including empty markers and new stub blocks.
-        Block->setAddress(orc::ExecutorAddr(BlockOrder++));
-        jitlink::Block *EndMarker = nullptr;
-        if (FallThroughBlocks.contains(Block)) {
-          // Install the guard before collecting branches so it participates in
-          // reservation sharing and is relaxed using the final layout too.
-          jitlink::Block *ContinuationBlock;
-          if (Index + 1 < Blocks.size()) {
-            // Skip the next block's alignment padding as well as our stubs.
-            ContinuationBlock = Blocks[Index + 1];
-          } else {
-            // Keep the one-past continuation after all slots, including the
-            // guard's own reservation. The marker itself occupies no space.
-            EndMarker =
-                &G.createZeroFillBlock(Section, 0, orc::ExecutorAddr(), 1, 0);
-            ContinuationBlock = EndMarker;
-          }
-          auto &Continuation =
-              G.addAnonymousSymbol(*ContinuationBlock, 0, 0, true, true);
-          const auto BranchOffset = Block->getSize() - 4;
-          support::endian::write32le(
-              Block->getMutableContent(G).data() + BranchOffset, 0x14000000);
-          Block->addEdge(jitlink::aarch64::Branch26PCRel, BranchOffset,
-                         Continuation, 0);
-        }
-        const uint64_t StubBlockOffset =
-            alignTo(SectionOffset + Block->getSize(), 4);
-        const size_t FirstNewStub = StubRecords.size();
-        for (const jitlink::Edge &Edge : Block->edges()) {
-          if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
-            continue;
-
-          const auto Target = getAArch64StubTarget(Edge);
-          auto It = SharedStubs.find(Target);
-          const uint64_t SourceOffset = SectionOffset + Edge.getOffset();
-          if (It == SharedStubs.end() ||
-              !isInt<28>(int64_t(It->second.SectionOffset - SourceOffset))) {
-            const uint64_t SlotOffset =
-                StubBlockOffset + 20 * (StubRecords.size() - FirstNewStub);
-            It = SharedStubs
-                     .insert_or_assign(
-                         Target, ReservedStub{StubRecords.size(), SlotOffset})
-                     .first;
-            StubRecords.emplace_back();
-          }
-          StubRecords[It->second.RecordIndex].Branches.push_back(
-              {Block, Edge.getOffset()});
-        }
-
-        const uint64_t NumNewStubs = StubRecords.size() - FirstNewStub;
-        SectionOffset += Block->getSize();
-        if (NumNewStubs) {
-          jitlink::Block &StubBlock = G.createMutableContentBlock(
-              Section, G.allocateBuffer(20 * NumNewStubs),
-              orc::ExecutorAddr(BlockOrder++), 4, 0);
-
-          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: created " << NumNewStubs
-                            << " slots after block for stubs\n");
-
-          auto Content = StubBlock.getAlreadyMutableContent();
-          for (size_t Offset = 0; Offset < Content.size(); Offset += 4)
-            support::endian::write32le(Content.data() + Offset,
-                                       0xd503201f); // NOP
-
-          for (uint64_t SymbolNum = 0; SymbolNum < NumNewStubs; ++SymbolNum)
-            StubRecords[FirstNewStub + SymbolNum].SlotSym =
-                &G.addAnonymousSymbol(StubBlock, 20 * SymbolNum, 20, true,
-                                      true);
-          SectionOffset = StubBlockOffset + StubBlock.getSize();
-        }
-
-        if (EndMarker)
-          EndMarker->setAddress(orc::ExecutorAddr(BlockOrder++));
-      }
-    }
 
     return Error::success();
   }
@@ -527,25 +440,35 @@ JITLinkLinker::orderedBlocks(const jitlink::Section &Section) {
   return Blocks;
 }
 
-size_t JITLinkLinker::sectionSize(const jitlink::Section &Section) {
-  size_t Size = 0;
-
-  for (const auto *Block : orderedBlocks(Section)) {
-    Size = jitlink::alignToBlock(Size, *Block);
-    Size += Block->getSize();
+uint64_t JITLinkLinker::layoutBlocks(ArrayRef<jitlink::Block *> Blocks,
+                                     uint64_t Offset) {
+  for (auto *Block : Blocks) {
+    Offset = jitlink::alignToBlock(Offset, *Block);
+    Block->setAddress(orc::ExecutorAddr(Offset));
+    Offset += Block->getSize();
   }
+  return Offset;
+}
 
+size_t
+JITLinkLinker::getSectionAllocationSize(const jitlink::Section &Section) {
+  uint64_t Size = 0;
+  for (const auto *Block : Section.blocks())
+    Size = std::max(Size, Block->getAddress().getValue() + Block->getSize());
   return Size;
+}
+
+void JITLinkLinker::assignBlockAddresses(jitlink::Section &Section,
+                                         const char *Buffer, uint64_t Address) {
+  for (auto *Block : Section.blocks())
+    Block->setAddress(
+        orc::ExecutorAddr(Address + (Block->getContent().data() - Buffer)));
 }
 
 namespace {
 
-struct FragmentSectionLayout {
-  SmallVector<jitlink::Block *> Blocks;
-  uint64_t Alignment = 1;
-};
-using FragmentSectionLayouts =
-    MapVector<jitlink::Section *, FragmentSectionLayout>;
+using FragmentBlocksBySection =
+    DenseMap<jitlink::Section *, SmallVector<jitlink::Block *>>;
 
 Error validateFragmentEdge(const jitlink::Block &Source,
                            const jitlink::Edge &Edge) {
@@ -604,7 +527,7 @@ Error validateFragmentEdges(jitlink::LinkGraph &G,
 Error mergeFragmentSection(jitlink::LinkGraph &G,
                            const EmittedFragmentSection &Fragment,
                            jitlink::Section &Input,
-                           FragmentSectionLayouts &Layouts,
+                           FragmentBlocksBySection &BlocksBySection,
                            DenseSet<jitlink::Block *> &FallThroughBlocks) {
   auto *Output = G.findSectionByName(Fragment.OutputSection);
   if (!Output) {
@@ -616,44 +539,25 @@ Error mergeFragmentSection(jitlink::LinkGraph &G,
       Output->getMemLifetime() != Input.getMemLifetime())
     return make_error<jitlink::JITLinkError>(
         "Incompatible logical output section for " + Fragment.Name);
-  auto [It, Inserted] = Layouts.try_emplace(Output);
-  auto &Layout = It->second;
+  auto [It, Inserted] = BlocksBySection.try_emplace(Output);
+  auto &Blocks = It->second;
   if (Inserted)
-    llvm::append_range(Layout.Blocks, JITLinkLinker::orderedBlocks(*Output));
-  Layout.Alignment = std::max(Layout.Alignment, Fragment.OutputAlignment);
-  auto Blocks = JITLinkLinker::orderedBlocks(Input);
-  if (Fragment.HasFallThrough) {
-    assert(!Blocks.empty() && Blocks.back()->getSize() >= 4 &&
-           "Missing emitted fall-through branch");
-    FallThroughBlocks.insert(Blocks.back());
-  }
-  llvm::append_range(Layout.Blocks, Blocks);
-  G.mergeSections(*Output, Input);
-  return Error::success();
-}
+    Blocks = JITLinkLinker::orderedBlocks(*Output);
+  auto *Block = *Input.blocks().begin(); // One block per emitted fragment.
+  Blocks.push_back(Block);
 
-Error assignFragmentOrderKeys(jitlink::Section &Section,
-                              FragmentSectionLayout &Layout) {
-  if (Layout.Blocks.empty())
-    return Error::success();
-  for (auto *Block : Layout.Blocks)
-    Layout.Alignment = std::max(Layout.Alignment, Block->getAlignment());
-  // The memory manager gets the section alignment from the first block.
-  // Only promote that block, not every function to the text section alignment.
-  if (Layout.Blocks.front()->getAlignmentOffset())
+  // Carry the logical section alignment on its first block. The memory
+  // manager also accounts for every block's own alignment.
+  if (Blocks.front()->getAlignmentOffset())
     return make_error<jitlink::JITLinkError>(
-        "Unsupported first block alignment offset in " + Section.getName());
-  Layout.Blocks.front()->setAlignment(Layout.Alignment);
-
-  uint64_t Offset = 0;
-  for (auto *Block : Layout.Blocks) {
-    Offset = jitlink::alignToBlock(Offset, *Block);
-    Block->setAddress(orc::ExecutorAddr(Offset));
-    // These are ordering keys, not final addresses. Even empty marker blocks
-    // need distinct keys. The reservation pass assigns new keys to include
-    // the shared stub blocks.
-    Offset += std::max<uint64_t>(1, Block->getSize());
+        "Unsupported first block alignment offset in " + Output->getName());
+  Blocks.front()->setAlignment(
+      std::max(Blocks.front()->getAlignment(), Fragment.OutputAlignment));
+  if (Fragment.HasFallThrough) {
+    assert(Block->getSize() >= 4 && "Missing emitted fall-through branch");
+    FallThroughBlocks.insert(Block);
   }
+  G.mergeSections(*Output, Input);
   return Error::success();
 }
 
@@ -664,7 +568,7 @@ Error JITLinkLinker::mergeFragmentSections(
     DenseSet<jitlink::Block *> &FallThroughBlocks) {
   LLVM_DEBUG(dbgs() << "BOLT-DEBUG: begin of Fragment Sections merging.\n");
 
-  FragmentSectionLayouts Layouts;
+  FragmentBlocksBySection BlocksBySection;
   DenseSet<jitlink::Block *> FragmentBlocks;
   SmallVector<jitlink::Section *> Sections;
   for (const auto &Fragment : Fragments) {
@@ -675,34 +579,238 @@ Error JITLinkLinker::mergeFragmentSections(
     if (!Section)
       return make_error<jitlink::JITLinkError>(
           "Missing emitted fragment section " + Fragment.Name);
+    // ELFLinkGraphBuilder creates one block per input section. Enforce this
+    // before merging: batching must never split an MC-resolved fragment.
+    if (Section->blocks_size() != 1)
+      return make_error<jitlink::JITLinkError>(
+          "Expected one block in emitted fragment section " + Fragment.Name);
     Sections.push_back(Section);
-    for (auto *Block : Section->blocks())
-      FragmentBlocks.insert(Block);
+    FragmentBlocks.insert(*Section->blocks().begin());
   }
 
   if (Error Err = validateFragmentEdges(G, FragmentBlocks))
     return Err;
 
   for (auto [Index, Fragment] : llvm::enumerate(Fragments))
-    if (Error Err = mergeFragmentSection(G, Fragment, *Sections[Index], Layouts,
-                                         FallThroughBlocks))
+    if (Error Err = mergeFragmentSection(G, Fragment, *Sections[Index],
+                                         BlocksBySection, FallThroughBlocks))
       return Err;
 
-  for (auto &[Section, Layout] : Layouts)
-    if (Error Err = assignFragmentOrderKeys(*Section, Layout))
-      return Err;
+  // Preserve emission order only. Byte placement happens in the linker.
+  for (auto &[Section, Blocks] : BlocksBySection)
+    for (auto [Index, Block] : llvm::enumerate(Blocks))
+      Block->setAddress(orc::ExecutorAddr(Index));
   return Error::success();
 }
 
-void JITLinkLinker::assignBlockAddresses(jitlink::Section &Section,
-                                         uint64_t Address) {
-  uint64_t BlockOffset = 0;
-  for (auto *Block : orderedBlocks(Section)) {
-    // Mirror the memory manager's section-relative packing.
-    BlockOffset = jitlink::alignToBlock(BlockOffset, *Block);
-    Block->setAddress(orc::ExecutorAddr(Address + BlockOffset));
-    BlockOffset += Block->getSize();
+namespace {
+
+/// Guards jump to the next original fragment, over any intervening islands.
+/// The last continuation is placed after all tail islands by the caller.
+jitlink::Block *
+addFallThroughGuards(jitlink::LinkGraph &G, ArrayRef<jitlink::Block *> Blocks,
+                     const DenseSet<jitlink::Block *> &FallThroughBlocks) {
+  jitlink::Block *EndMarker = nullptr;
+  for (auto [Index, Block] : llvm::enumerate(Blocks)) {
+    if (!FallThroughBlocks.contains(Block))
+      continue;
+    jitlink::Block *Next;
+    if (Index + 1 < Blocks.size()) {
+      Next = Blocks[Index + 1];
+    } else {
+      EndMarker = &G.createZeroFillBlock(Blocks.back()->getSection(), 0,
+                                         orc::ExecutorAddr(), 1, 0);
+      Next = EndMarker;
+    }
+    auto &Target = G.addAnonymousSymbol(*Next, 0, 0, true, true);
+    const auto Offset = Block->getSize() - 4;
+    support::endian::write32le(Block->getMutableContent(G).data() + Offset,
+                               0x14000000);
+    Block->addEdge(jitlink::aarch64::Branch26PCRel, Offset, Target, 0);
   }
+  return EndMarker;
+}
+
+/// One forward sweep over whole fragments. Only block addresses carry layout;
+/// each reservation already has its final island block and slot symbol.
+class AArch64StubPlacer {
+  static constexpr uint64_t BranchDistance = 128 * 1024 * 1024;
+  static constexpr uint64_t BatchSize = 32 * 1024 * 1024;
+  static constexpr uint64_t MaxIslandSize = 16 * 1024 * 1024;
+  static constexpr uint64_t StubSize = 20;
+  static constexpr uint64_t Unplaced = std::numeric_limits<uint64_t>::max();
+
+  jitlink::LinkGraph &G;
+  jitlink::Section &Section;
+  std::vector<JITLinkLinker::AArch64Stub> &Stubs;
+  DenseMap<AArch64StubTarget, size_t> SharedStubs;
+
+public:
+  AArch64StubPlacer(jitlink::LinkGraph &G, jitlink::Section &Section,
+                    std::vector<JITLinkLinker::AArch64Stub> &Stubs)
+      : G(G), Section(Section), Stubs(Stubs) {}
+
+  Error run(const DenseSet<jitlink::Block *> &FallThroughBlocks,
+            raw_ostream *Log) {
+    auto Blocks = JITLinkLinker::orderedBlocks(Section);
+    auto *EndMarker = addFallThroughGuards(G, Blocks, FallThroughBlocks);
+    for (auto *Block : Section.blocks())
+      Block->setAddress(orc::ExecutorAddr(Unplaced));
+
+    uint64_t Offset = 0;
+    for (size_t B = 0, D = 0; B < Blocks.size();) {
+      // B..C: current batch. C..D: placed look-ahead. New island goes at D.
+      // First extend D, leaving room for the island within reach of B.
+      while (D < Blocks.size()) {
+        auto *Block = Blocks[D];
+        const uint64_t End = JITLinkLinker::layoutBlocks({Block}, Offset);
+        if (D != B && alignTo(End, 4) + MaxIslandSize >
+                          Blocks[B]->getAddress().getValue() + BranchDistance) {
+          Block->setAddress(orc::ExecutorAddr(Unplaced));
+          break;
+        }
+        Offset = End;
+        ++D;
+      }
+
+      // Select C by code size and worst-case slot count. Keep large fragments
+      // whole; reserveBatch checks every actual slot's reach and island size.
+      size_t C = B + 1;
+      uint64_t NumBranches = countBranches(*Blocks[B]);
+      while (C < D &&
+             Blocks[C]->getAddress().getValue() + Blocks[C]->getSize() <
+                 Blocks[B]->getAddress().getValue() + BatchSize) {
+        const uint64_t Next = countBranches(*Blocks[C]);
+        if (NumBranches + Next > MaxIslandSize / StubSize)
+          break;
+        NumBranches += Next;
+        ++C;
+      }
+      const auto Batch = ArrayRef(Blocks).slice(B, C - B);
+      const size_t FirstNewStub = Stubs.size();
+      if (Error Err = reserveBatch(Batch, Offset))
+        return Err;
+      if (Log)
+        printBatch(*Log, Batch, B, D, FirstNewStub);
+      B = C;
+    }
+    if (EndMarker)
+      JITLinkLinker::layoutBlocks({EndMarker}, Offset);
+    return Error::success();
+  }
+
+private:
+  void printBatch(raw_ostream &OS, ArrayRef<jitlink::Block *> Batch,
+                  size_t Begin, size_t LookAheadEnd,
+                  size_t FirstNewStub) const {
+    uint64_t CodeSize = 0;
+    for (const auto *Block : Batch)
+      CodeSize += Block->getSize();
+    const size_t NumNewStubs = Stubs.size() - FirstNewStub;
+    OS << "BOLT-INFO: JITLink batch: section=" << Section.getName()
+       << " fragments=[" << Begin << ", " << Begin + Batch.size()
+       << ") look-ahead-end=" << LookAheadEnd << '\n'
+       << "BOLT-INFO:   " << Batch.size() << " fragment(s), " << CodeSize
+       << " emitted bytes, section-offsets=[0x"
+       << Twine::utohexstr(Batch.front()->getAddress().getValue()) << ", 0x"
+       << Twine::utohexstr(Batch.back()->getAddress().getValue() +
+                           Batch.back()->getSize())
+       << ")\n"
+       << "BOLT-INFO:   " << NumNewStubs << " new stub slot(s), "
+       << NumNewStubs * StubSize << " reserved bytes";
+    if (NumNewStubs)
+      OS << ", island-offset=0x"
+         << Twine::utohexstr(
+                Stubs[FirstNewStub].SlotSym->getAddress().getValue());
+    OS << '\n';
+  }
+
+  static uint64_t countBranches(const jitlink::Block &Block) {
+    return llvm::count_if(Block.edges(), [](const auto &Edge) {
+      return Edge.getKind() == jitlink::aarch64::Branch26PCRel;
+    });
+  }
+
+  bool isProvenDirect(const jitlink::Edge &Edge, uint64_t Source) const {
+    const auto &Target = Edge.getTarget();
+    return Target.isDefined() && &Target.getSection() == &Section &&
+           Target.getBlock().getAddress().getValue() != Unplaced &&
+           isInt<28>(int64_t(
+               (Target.getAddress() + Edge.getAddend()).getValue() - Source));
+  }
+
+  Error reserveBatch(ArrayRef<jitlink::Block *> Blocks, uint64_t &Offset) {
+    const uint64_t IslandOffset = alignTo(Offset, 4);
+    jitlink::Block *Island = nullptr;
+    SmallVector<const jitlink::Edge *, 8> Branches;
+    for (auto *Block : Blocks) {
+      Branches.clear();
+      for (const auto &Edge : Block->edges())
+        if (Edge.getKind() == jitlink::aarch64::Branch26PCRel)
+          Branches.push_back(&Edge);
+      // Source order makes the latest slot sufficient: if it is too far
+      // backward, all older slots are too. This replaces mold's A sweep.
+      llvm::stable_sort(Branches, [](const auto *L, const auto *R) {
+        return L->getOffset() < R->getOffset();
+      });
+      for (const auto *Edge : Branches) {
+        const uint64_t Source =
+            Block->getAddress().getValue() + Edge->getOffset();
+        if (isProvenDirect(*Edge, Source))
+          continue;
+        auto [It, Inserted] =
+            SharedStubs.try_emplace(getAArch64StubTarget(*Edge), Stubs.size());
+        if (Inserted ||
+            !isInt<28>(int64_t(
+                Stubs[It->second].SlotSym->getAddress().getValue() - Source))) {
+          const uint64_t SlotOffset = Island ? Island->getSize() : 0;
+          if (!isInt<28>(int64_t(IslandOffset + SlotOffset - Source)))
+            return make_error<jitlink::JITLinkError>(
+                "Cannot place a reachable AArch64 stub island in " +
+                Section.getName() + ": emitted fragment is too large");
+          if (SlotOffset + StubSize > MaxIslandSize)
+            return make_error<jitlink::JITLinkError>(
+                "AArch64 stub island exceeds its reserved size in " +
+                Section.getName());
+          if (!Island)
+            Island = &G.createZeroFillBlock(
+                Section, 0, orc::ExecutorAddr(IslandOffset), 4, 0);
+          // Grow the block without allocating bytes until its size is known.
+          Island->setZeroFillSize(SlotOffset + StubSize);
+          It->second = Stubs.size();
+          Stubs.push_back(
+              {&G.addAnonymousSymbol(*Island, SlotOffset, StubSize, true, true),
+               {}});
+        }
+        Stubs[It->second].Branches.push_back({Block, Edge->getOffset()});
+      }
+    }
+    if (Island) {
+      auto Content = G.allocateBuffer(Island->getSize());
+      for (size_t I = 0; I < Content.size(); I += 4)
+        support::endian::write32le(Content.data() + I, 0xd503201f); // NOP
+      Island->setMutableContent(Content);
+      Offset = IslandOffset + Content.size();
+    }
+    return Error::success();
+  }
+};
+
+} // namespace
+
+Expected<std::vector<JITLinkLinker::AArch64Stub>>
+JITLinkLinker::reserveAArch64Stubs(
+    jitlink::LinkGraph &G, const DenseSet<jitlink::Block *> &FallThroughBlocks,
+    raw_ostream *Log) {
+  std::vector<AArch64Stub> Stubs;
+  for (jitlink::Section &Section : G.sections()) {
+    if ((Section.getMemProt() & orc::MemProt::Exec) == orc::MemProt::None)
+      continue;
+    if (Error Err =
+            AArch64StubPlacer(G, Section, Stubs).run(FallThroughBlocks, Log))
+      return std::move(Err);
+  }
+  return Stubs;
 }
 
 } // namespace bolt

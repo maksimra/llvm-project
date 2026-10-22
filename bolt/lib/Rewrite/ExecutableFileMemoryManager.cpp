@@ -35,8 +35,10 @@ SmallVector<jitlink::Section *> orderedSections(jitlink::LinkGraph &G) {
 }
 
 size_t sectionAlignment(const jitlink::Section &Section) {
-  assert(!Section.empty() && "Cannot get alignment for empty section");
-  return JITLinkLinker::orderedBlocks(Section).front()->getAlignment();
+  uint64_t Alignment = 1;
+  for (const auto *Block : Section.blocks())
+    Alignment = std::max(Alignment, Block->getAlignment());
+  return Alignment;
 }
 
 StringRef sectionName(const jitlink::Section &Section,
@@ -70,7 +72,7 @@ struct AllocInfo {
   }
 
   SectionAllocInfo allocateSection(const jitlink::Section &Section) {
-    auto Size = JITLinkLinker::sectionSize(Section);
+    auto Size = JITLinkLinker::getSectionAllocationSize(Section);
     auto Alignment = sectionAlignment(Section);
     auto *Buf = allocate_buffer(Size, Alignment);
     SectionAllocInfo Alloc{Buf, Size, Alignment};
@@ -100,6 +102,18 @@ public:
 };
 
 } // anonymous namespace
+
+void ExecutableFileMemoryManager::copySectionContents(jitlink::Section &Section,
+                                                      char *Buffer) {
+  for (auto *Block : Section.blocks()) {
+    auto *BlockBuffer = Buffer + Block->getAddress().getValue();
+    if (Block->isZeroFill())
+      std::memset(BlockBuffer, 0, Block->getSize());
+    else
+      std::memcpy(BlockBuffer, Block->getContent().data(), Block->getSize());
+    Block->setMutableContent({BlockBuffer, Block->getSize()});
+  }
+}
 
 void ExecutableFileMemoryManager::updateSection(
     const jitlink::Section &JLSection, uint8_t *Contents, size_t Size,
@@ -196,21 +210,7 @@ void ExecutableFileMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
     updateSection(*Section, static_cast<uint8_t *>(SectionAlloc.Address),
                   SectionAlloc.Size, SectionAlloc.Alignment);
 
-    size_t CurrentOffset = 0;
-    auto *Buf = static_cast<char *>(SectionAlloc.Address);
-    for (auto *Block : JITLinkLinker::orderedBlocks(*Section)) {
-      CurrentOffset = jitlink::alignToBlock(CurrentOffset, *Block);
-      auto BlockSize = Block->getSize();
-      auto *BlockBuf = Buf + CurrentOffset;
-
-      if (Block->isZeroFill())
-        std::memset(BlockBuf, 0, BlockSize);
-      else
-        std::memcpy(BlockBuf, Block->getContent().data(), BlockSize);
-
-      Block->setMutableContent({BlockBuf, Block->getSize()});
-      CurrentOffset += BlockSize;
-    }
+    copySectionContents(*Section, static_cast<char *>(SectionAlloc.Address));
   }
 
   OnAllocated(std::make_unique<BOLTInFlightAlloc>(std::move(Alloc)));

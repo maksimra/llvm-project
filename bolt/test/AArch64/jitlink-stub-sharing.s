@@ -8,10 +8,9 @@
 # RUN: llvm-bolt %t.exe -o %t.near --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 --print-stub-stats \
 # RUN:   | FileCheck %s --check-prefix=NEAR
-# NEAR: BOLT-INFO: JITLink stubs: slots=2 unused=2 short-adrp=0 long-mov=0 shared=0
+# NEAR: BOLT-INFO: JITLink stubs: slots=0 unused=0 short-adrp=0 long-mov=0 shared=0
 
-## Only two 20-byte slots are reserved, both after _start. In particular,
-## second has no reservation between its eight bytes of code and callee.
+## Lookahead proves all destinations reachable, so no slots are reserved.
 # RUN: llvm-objdump -d --no-show-raw-insn --section=.text %t.near \
 # RUN:   | FileCheck %s --check-prefix=NEAR-CODE
 # NEAR-CODE: [[#%x,START:]] <_start>:
@@ -19,11 +18,10 @@
 # NEAR-CODE-NEXT: bl {{.*}} <callee>
 # NEAR-CODE-NEXT: bl {{.*}} <callee{{.*}}>
 # NEAR-CODE-NEXT: b {{.*}} <callee>
-# NEAR-CODE-COUNT-10: nop
-# NEAR-CODE: {{0*}}[[#START + 64]] <second>:
+# NEAR-CODE: {{0*}}[[#START + 16]] <second>:
 # NEAR-CODE-NEXT: bl {{.*}}
 # NEAR-CODE-NEXT: b {{.*}} <callee>
-# NEAR-CODE: {{0*}}[[#START + 80]] <callee>:
+# NEAR-CODE: {{0*}}[[#START + 32]] <callee>:
 
 # RUN: llvm-bolt %t.exe -o %t.far --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 --pad-funcs-before=callee:134217984 \
@@ -58,6 +56,9 @@
 # SHARED-NEXT: bl 0x[[#STUB]]
 # SHARED-NEXT: bl 0x[[#%x,OFFSET_STUB:]]
 # SHARED-NEXT: b 0x[[#STUB]]
+# SHARED-LABEL: <second>:
+# SHARED-NEXT: bl 0x[[#OFFSET_STUB]]
+# SHARED-NEXT: b 0x[[#STUB]]
 # SHORT-NEXT: {{0*}}[[#STUB]]: adrp x16,
 # SHORT-NEXT: add x16, x16, #0x[[#%x,TARGET_LO:]]
 # SHORT-NEXT: br x16
@@ -78,9 +79,6 @@
 # LONG-NEXT: movk x16, #0x0, lsl #32
 # LONG-NEXT: movk x16, #0x0, lsl #48
 # LONG-NEXT: br x16
-# SHARED-LABEL: <second>:
-# SHARED-NEXT: bl 0x[[#OFFSET_STUB]]
-# SHARED-NEXT: b 0x[[#STUB]]
 
 ## A shared reservation outside Branch26 range must not be reused. Padding
 ## before each of second and callee leaves both callers out of target range,

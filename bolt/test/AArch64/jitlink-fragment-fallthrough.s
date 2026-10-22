@@ -11,26 +11,26 @@
 # RUN: llvm-objdump -d --no-show-raw-insn --section=.text %t.bolt \
 # RUN:   | FileCheck %s
 
-## The guard lands on continuation itself, past both reserved slots and padding.
+## Proven direct branches need no slots. The guard lands on continuation.
 # CHECK-LABEL: <_start>:
 # CHECK-NEXT: sub sp, sp, #0x10
 # CHECK-NEXT: str x30, [sp, #0x8]
 # CHECK-NEXT: bl {{.*}} <callee>
 # CHECK-NEXT: b 0x[[#%x,CONT:]] <continuation>
-# CHECK-COUNT-10: nop
+# CHECK-NOT: nop
 # CHECK: {{0*}}[[#CONT]] <continuation>:
 # CHECK-NEXT: ldr x30, [sp, #0x8]
 # CHECK-NEXT: add sp, sp, #0x10
 # CHECK-NEXT: b {{.*}} <callee>
 
-## An indirect call reserves a slot for its guard too.
+## The indirect call's guard is also proven direct.
 # CHECK-LABEL: <indirect>:
 # CHECK-NEXT: blr x0
 # CHECK-NEXT: b 0x[[#%x,LAST:]] <last>
-# CHECK-COUNT-5: nop
+# CHECK-NOT: nop
 
-## last shares the earlier callee reservation. Its guard's continuation stays
-## after its own reserved slot at section end.
+## The final guard keeps a conservative reservation for the section-end marker,
+## which is placed after the tail island.
 # CHECK: {{0*}}[[#LAST]] <last>:
 # CHECK-NEXT: bl {{.*}} <callee>
 # CHECK-NEXT: b 0x[[#LAST + 28]]

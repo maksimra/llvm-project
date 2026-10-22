@@ -13,22 +13,19 @@
 # RUN: llvm-objdump -d --no-show-raw-insn \
 # RUN:   --disassemble-symbols=_start,continuation %t.bolt | FileCheck %s
 
-## bl reaches the stub; the following guard jumps straight to continuation.
-## An ADRP/ADD/BR stub uses 12 of the 20 reserved bytes, leaving two NOPs.
+## The forward island follows continuation. Both original branches share it,
+## while the fall-through guard reaches continuation without a reservation.
 # CHECK-LABEL: <_start>:
 # CHECK-NEXT: sub sp, sp, #0x10
 # CHECK-NEXT: str x30, [sp, #0x8]
 # CHECK-NEXT: bl 0x[[#%x,CALL_STUB:]]
 # CHECK-NEXT: b {{.*}} <continuation>
+# CHECK-LABEL: <continuation>:
+# CHECK-NEXT: ldr x30, [sp, #0x8]
+# CHECK-NEXT: add sp, sp, #0x10
+# CHECK-NEXT: b 0x[[#CALL_STUB]]
 # CHECK-NEXT: {{0*}}[[#CALL_STUB]]: adrp x16,
 # CHECK-NEXT: add x16, x16,
 # CHECK-NEXT: br x16
 # CHECK-NEXT: nop
 # CHECK-NEXT: nop
-
-## An unconditional inter-fragment b reuses the call's stub. No second slot is
-## reserved after continuation.
-# CHECK-LABEL: <continuation>:
-# CHECK-NEXT: ldr x30, [sp, #0x8]
-# CHECK-NEXT: add sp, sp, #0x10
-# CHECK-NEXT: b 0x[[#CALL_STUB]]

@@ -39,7 +39,7 @@
 # RUN: llvm-objdump -d --no-show-raw-insn --no-symbolize-operands \
 # RUN:   --section=.text.bolt.extra.1 %t.deferred.bolt | FileCheck %s
 
-# STATS: BOLT-INFO: JITLink stubs: slots=1 unused=1 short-adrp=0 long-mov=0
+# STATS: BOLT-INFO: JITLink stubs: slots=0 unused=0 short-adrp=0 long-mov=0
 # STATS-NOT: BOLT-INFO: JITLink stubs:
 # CHECK: [[#%x,BRANCH:]]:{{[ \t]+}}b
 # CHECK-SAME: 0x[[#BRANCH + 16]]
