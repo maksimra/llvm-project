@@ -81,6 +81,12 @@ struct EmittedFragmentSection {
   uint64_t OutputAlignment;
   /// The fragment ends with a fall-through guard to be retargeted by JITLink.
   bool HasFallThrough;
+  /// Optional entry alignment, applied after the block's mandatory alignment.
+  /// Zero MaxAlignmentBytes disables it, as in BinaryEmitter::emitFunction.
+  uint64_t PreferredAlignment{1};
+  uint16_t MaxAlignmentBytes{0};
+  /// Skip any unexecuted --pad-funcs-before bytes when entering this fragment.
+  uint64_t EntryOffset{0};
 };
 
 /// Information on loadable part of the file.

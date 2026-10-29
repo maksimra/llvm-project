@@ -43,6 +43,10 @@ private:
   StringMap<SymbolInfo> Symtab;
 
 public:
+  /// Metadata must outlive fragment placement.
+  using FragmentMap =
+      DenseMap<const jitlink::Block *, const EmittedFragmentSection *>;
+
   struct AArch64Branch {
     jitlink::Block *SourceBlock;
     jitlink::Edge::OffsetT SourceOffset;
@@ -70,18 +74,18 @@ public:
   /// Rebase from the blocks' actual positions in the allocated section buffer.
   static void assignBlockAddresses(jitlink::Section &Section,
                                    const char *Buffer, uint64_t Address);
-  /// Merge fragment sections and collect blocks with fall-through guards.
-  static Error
-  mergeFragmentSections(jitlink::LinkGraph &G,
-                        ArrayRef<EmittedFragmentSection> Fragments,
-                        DenseSet<jitlink::Block *> &FallThroughBlocks);
+  /// Merge fragment sections and associate blocks with their emission metadata.
+  static Error mergeFragmentSections(jitlink::LinkGraph &G,
+                                     ArrayRef<EmittedFragmentSection> Fragments,
+                                     FragmentMap &FragmentsByBlock);
   /// Reserve shared AArch64 stub islands ahead of batches of whole fragments.
   /// Store the final section-relative placements in the blocks themselves.
   /// Each input code block is one indivisible emitted fragment section.
-  /// Optionally report each batch's placement and new reservations to Log.
+  /// Preserve its mandatory alignment and apply bounded entry preferences.
+  /// Optionally report aggregate batch and layout statistics per section to Log.
   static Expected<std::vector<AArch64Stub>>
   reserveAArch64Stubs(jitlink::LinkGraph &G,
-                      const DenseSet<jitlink::Block *> &FallThroughBlocks,
+                      const FragmentMap &FragmentsByBlock,
                       raw_ostream *Log = nullptr);
 };
 

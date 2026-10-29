@@ -339,15 +339,27 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 
   MCSection *Section =
       BC.getCodeSection(Function.getCodeSectionName(FF.getFragmentNum()));
+  const bool FragmentSections = useFragmentSections(BC);
+  const uint16_t MaxAlignBytes = FF.isSplitFragment()
+                                     ? Function.getMaxColdAlignmentBytes()
+                                     : Function.getMaxAlignmentBytes();
+  const size_t PrefixSize = opts::padFunctionBefore(Function);
   const bool HasFallThrough =
-      useFragmentSections(BC) && fragmentMayFallThrough(FF, BC);
-  if (useFragmentSections(BC)) {
+      FragmentSections && fragmentMayFallThrough(FF, BC);
+  if (FragmentSections) {
+    // Keep the logical section base aligned, but do not turn a preferred
+    // function alignment into a mandatory alignment of every fragment. MC
+    // records the requirements of the fragment's body (e.g. constant islands)
+    // on its private section. JITLink applies the bounded entry alignment.
+    Section->ensureMinAlignment(Align(BC.AlignFunctions));
+    if (MaxAlignBytes > 0)
+      Section->ensureMinAlignment(Function.getAlign());
     std::string Name =
         (Twine(".bolt.fragment.") + Twine(BC.EmittedFragmentSections.size()))
             .str();
-    BC.EmittedFragmentSections.push_back({Name, Section->getName().str(),
-                                          Section->getAlign().value(),
-                                          HasFallThrough});
+    BC.EmittedFragmentSections.push_back(
+        {Name, Section->getName().str(), Section->getAlign().value(),
+         HasFallThrough, Function.getAlignment(), MaxAlignBytes, PrefixSize});
     Section = BC.getCodeSection(Name);
   }
   Streamer.switchSection(Section);
@@ -358,19 +370,17 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
     // Set section alignment to at least maximum possible object alignment.
     // We need this to support LongJmp and other passes that calculates
     // tentative layout.
-    Section->ensureMinAlignment(Align(BC.AlignFunctions));
+    if (!FragmentSections)
+      Section->ensureMinAlignment(Align(BC.AlignFunctions));
 
     Streamer.emitCodeAlignment(Function.getMinAlign(), *BC.STI);
-    uint16_t MaxAlignBytes = FF.isSplitFragment()
-                                 ? Function.getMaxColdAlignmentBytes()
-                                 : Function.getMaxAlignmentBytes();
-    if (MaxAlignBytes > 0)
+    if (!FragmentSections && MaxAlignBytes > 0)
       Streamer.emitCodeAlignment(Function.getAlign(), *BC.STI, MaxAlignBytes);
   } else {
     Streamer.emitCodeAlignment(Function.getAlign(), *BC.STI);
   }
 
-  if (size_t Padding = opts::padFunctionBefore(Function)) {
+  if (size_t Padding = PrefixSize) {
     // Handle padFuncsBefore after the above alignment logic but before
     // symbol addresses are decided.
     if (!BC.HasRelocations) {

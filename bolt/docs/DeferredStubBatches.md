@@ -100,12 +100,12 @@ It cannot provide this emission policy in the relocation/reordering pipeline.
 
 ## Batch diagnostics
 
-Deferred linking reports every batch through `BC.outs()`, like `relax-exp`'s
-cluster diagnostics. Each group includes its logical output section, the
-half-open fragment index range B..C, look-ahead end D, emitted byte count,
-section-relative start/end offsets, new slot count and reserved island bytes.
-The island offset is printed only when new slots were created. A batch with
-zero new slots may still use an earlier island.
+Deferred linking reports aggregate statistics per output section through
+`BC.outs()`. The `BOLT-INFO: JITLink batches:` line gives the number of batches,
+fragments, stub islands and reserved slots, followed by the section's layout
+byte counts. Individual fragment names, batch ranges, look-ahead boundaries and
+island offsets are not printed. Batches reusing earlier islands still contribute
+to the batch count, but do not increase the island or slot counts.
 
 These are placement/reservation statistics, before virtual address mapping and
 materialization. Final ADRP/MOV/unused/shared counts remain controlled by

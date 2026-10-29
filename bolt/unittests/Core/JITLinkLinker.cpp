@@ -86,7 +86,11 @@ protected:
 
   Expected<std::vector<JITLinkLinker::AArch64Stub>>
   reserve(const DenseSet<Block *> &FallThroughBlocks = {}) {
-    return JITLinkLinker::reserveAArch64Stubs(G, FallThroughBlocks);
+    EmittedFragmentSection Guard{"", "", 1, true};
+    JITLinkLinker::FragmentMap FragmentsByBlock;
+    for (const auto *Block : FallThroughBlocks)
+      FragmentsByBlock[Block] = &Guard;
+    return JITLinkLinker::reserveAArch64Stubs(G, FragmentsByBlock);
   }
 
   Block &block(uint64_t Size, uint64_t Alignment = 4,
@@ -182,8 +186,9 @@ TEST_F(AArch64StubBatchTest, RejectSplitEmittedFragment) {
   G.createContentBlock(Input, ArrayRef<char>("bbbb", 4), orc::ExecutorAddr(4),
                        4, 0);
   EmittedFragmentSection Fragment{".bolt.fragment.0", ".text", 4, false};
-  DenseSet<Block *> Guards;
-  auto Err = JITLinkLinker::mergeFragmentSections(G, {Fragment}, Guards);
+  JITLinkLinker::FragmentMap FragmentsByBlock;
+  auto Err =
+      JITLinkLinker::mergeFragmentSections(G, {Fragment}, FragmentsByBlock);
   ASSERT_TRUE(bool(Err));
   EXPECT_NE(toString(std::move(Err)).find("Expected one block"),
             std::string::npos);
@@ -198,6 +203,30 @@ TEST_F(AArch64StubBatchTest, SkipProvenDirectBranches) {
   auto Stubs = reserve();
   ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
   EXPECT_TRUE(Stubs->empty());
+}
+
+TEST_F(AArch64StubBatchTest, BoundedEntryAlignmentPreservesBodyAlignment) {
+  block(4);
+  auto &Skip = block(28);
+  auto &AtLimit = block(4);
+  auto &Disabled = block(4);
+  auto &Body = block(4, 16);
+  EmittedFragmentSection Preferred{"", "", 1, false, 64, 32};
+  EmittedFragmentSection NoPadding{"", "", 1, false, 64, 0};
+  EmittedFragmentSection SmallBudget{"", "", 1, false, 64, 4};
+  JITLinkLinker::FragmentMap FragmentsByBlock{{&Skip, &Preferred},
+                                              {&AtLimit, &Preferred},
+                                              {&Disabled, &NoPadding},
+                                              {&Body, &SmallBudget}};
+  auto Stubs = JITLinkLinker::reserveAArch64Stubs(G, FragmentsByBlock);
+  ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
+  EXPECT_TRUE(Stubs->empty());
+  EXPECT_EQ(Skip.getAddress().getValue(), 4u);     // 60 exceeds the budget.
+  EXPECT_EQ(AtLimit.getAddress().getValue(), 64u); // Exactly 32 is allowed.
+  EXPECT_EQ(Disabled.getAddress().getValue(), 68u);
+  // Mandatory, even with budget 4.
+  EXPECT_EQ(Body.getAddress().getValue(), 80u);
+  EXPECT_EQ(Body.getAlignment(), 16u);
 }
 
 TEST_F(AArch64StubBatchTest, ShareAliasesButDistinguishAddends) {

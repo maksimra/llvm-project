@@ -10,16 +10,11 @@
 # RUN:   --custom-allocation-vma=0x40000000 \
 # RUN:   --pad-funcs-before=second:83886080,third:83886080 \
 # RUN:   --print-stub-stats --verify-branch26-range \
-# RUN:   | FileCheck %s --check-prefixes=BATCHES,STATS
-# BATCHES: BOLT-INFO: JITLink batch: section=.text fragments=[0, 1) look-ahead-end=2
-# BATCHES-NEXT: BOLT-INFO:   1 fragment(s), 4 emitted bytes, section-offsets=[0x0, 0x4)
-# BATCHES-NEXT: BOLT-INFO:   1 new stub slot(s), 20 reserved bytes, island-offset=0x5000008
-# BATCHES-NEXT: BOLT-INFO: JITLink batch: section=.text fragments=[1, 2) look-ahead-end=2
-# BATCHES-NEXT: BOLT-INFO:   1 fragment(s), 83886084 emitted bytes, section-offsets=[0x4, 0x5000008)
-# BATCHES-NEXT: BOLT-INFO:   0 new stub slot(s), 0 reserved bytes
-# BATCHES-NEXT: BOLT-INFO: JITLink batch: section=.text fragments=[2, 3) look-ahead-end=3
-# BATCHES-NEXT: BOLT-INFO:   1 fragment(s), 83886084 emitted bytes, section-offsets=[0x500001c, 0xa000020)
-# BATCHES-NEXT: BOLT-INFO:   0 new stub slot(s), 0 reserved bytes
+# RUN:   | FileCheck %s --check-prefixes=BATCHES,STATS \
+# RUN:     --implicit-check-not="BOLT-INFO: JITLink batch:"
+## Report the three batches together, including batches reusing an older island.
+# BATCHES: BOLT-INFO: JITLink batches: section=.text batches=3 fragments=3 islands=1 slots=1
+# BATCHES-NEXT: BOLT-INFO: JITLink layout: section=.text emitted-bytes=167772172 guard-bytes=0 stub-bytes=20 alignment-bytes=0 total-bytes=167772192
 # STATS: BOLT-INFO: JITLink stubs: slots=1 unused=0 short-adrp=1 long-mov=0 shared=2
 # RUN: llvm-objdump -d --no-show-raw-insn \
 # RUN:   --disassemble-symbols=_start,second,third %t.bolt | FileCheck %s

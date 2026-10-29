@@ -21,7 +21,7 @@
 # NEAR-CODE: {{0*}}[[#START + 16]] <second>:
 # NEAR-CODE-NEXT: bl {{.*}}
 # NEAR-CODE-NEXT: b {{.*}} <callee>
-# NEAR-CODE: {{0*}}[[#START + 32]] <callee>:
+# NEAR-CODE: {{0*}}[[#START + 24]] <callee>:
 
 # RUN: llvm-bolt %t.exe -o %t.far --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 --pad-funcs-before=callee:134217984 \
@@ -104,12 +104,12 @@
 ## bytes makes only second's last branch unable to reach its original slot.
 # RUN: llvm-bolt %t.exe -o %t.boundary --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 \
-# RUN:   --pad-funcs-before=second:134217676,callee:134217984 \
+# RUN:   --pad-funcs-before=second:134217684,callee:134217984 \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=FAR
 # RUN: llvm-bolt %t.exe -o %t.beyond --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 \
-# RUN:   --pad-funcs-before=second:134217680,callee:134217984 \
+# RUN:   --pad-funcs-before=second:134217688,callee:134217984 \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=BEYOND
 # BEYOND: BOLT-INFO: JITLink stubs: slots=3 unused=0 short-adrp=3 long-mov=0 shared=3
