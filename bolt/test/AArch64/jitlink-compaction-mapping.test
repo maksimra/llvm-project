@@ -1,0 +1,35 @@
+## Compaction validates the same section and external addresses that the
+## final mapper commits, including old-text placement and moved data.
+# REQUIRES: system-linux
+
+# RUN: llvm-mc -filetype=obj -triple=aarch64-linux \
+# RUN:   %p/merge-text-sections.s -o %t.o
+# RUN: ld.lld %t.o -o %t.exe -q --entry=_start
+# RUN: link_fdata --no-lbr %p/merge-text-sections.s %t.exe %t.fdata
+# RUN: llvm-bolt %t.exe -o %t.old --data=%t.fdata --split-functions --lite=0 \
+# RUN:   --turn-off-stubs --use-old-text --align-text=4 --strict \
+# RUN:   --merge-text-sections --verify-branch26-range --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=OLD
+# OLD: JITLink compaction: {{.*}}stub-bytes=0 fallback=0
+# OLD: using original .text
+# OLD: merged 2 code sections into .text
+# RUN: llvm-bolt %t.exe -o %t.reverse --data=%t.fdata --split-functions --lite=0 \
+# RUN:   --turn-off-stubs --use-old-text --align-text=4 --hot-functions-at-end \
+# RUN:   --verify-branch26-range --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=REVERSE
+# REVERSE: JITLink compaction: {{.*}}stub-bytes=0 fallback=0
+# REVERSE: using original .text
+
+## Page-aligned writable data is mapped after the compacted code. Its symbols
+## are resolved against the proposed bases before notifyResolved/lookup.
+# RUN: %clang %cflags -fPIC -pie -O3 -Wl,-q \
+# RUN:   %p/../reorder-data-writable-ptload.c -o %t.data.exe
+# RUN: llvm-bolt %t.data.exe -o %t.data --reorder-data=.data \
+# RUN:   --data=%p/../Inputs/reorder-data-writable-ptload.fdata \
+# RUN:   --turn-off-stubs --verify-branch26-range \
+# RUN:   | FileCheck %s --check-prefix=DATA
+# DATA: JITLink compaction: {{.*}}stub-bytes=0 fallback=0
+# RUN: llvm-readelf -SlW %t.data | FileCheck %s --check-prefix=SEGMENT
+# SEGMENT: .bolt.org.data
+# SEGMENT: {{.*}} .data PROGBITS [[#%x,ADDR:]] [[#%x,OFF:]]
+# SEGMENT: LOAD 0x{{.*}}[[#OFF]] 0x{{.*}}[[#ADDR]] {{.*}} RW

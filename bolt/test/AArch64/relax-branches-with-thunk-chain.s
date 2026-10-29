@@ -35,6 +35,19 @@
 # RUN:   --disassemble-symbols=A,B,C,D,A.cold.0,B.cold.0,C.cold.0,D.cold.0,__AArch64_forward_Thunk_1,__AArch64_forward_Thunk_4,__AArch64_forward_Thunk_5,__AArch64_backward_Thunk_0,__AArch64_backward_Thunk_2,__AArch64_backward_Thunk_3 \
 # RUN:   %t.hfe.bolt | FileCheck %s --check-prefix=CHECK-HFE-OUTPUT
 
+## Late compaction also builds B-only chains, including multiple hops and
+## sharing, without retaining the unused 20-byte reservations.
+# RUN: llvm-bolt %t -o %t.deferred --data %t.fdata --split-functions \
+# RUN:   --turn-off-stubs --verify-branch26-range --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=DEFERRED
+# RUN: llvm-bolt %t -o %t.hfe.deferred --data %t.fdata --split-functions \
+# RUN:   --turn-off-stubs --hot-functions-at-end --verify-branch26-range \
+# RUN:   --print-stub-stats | FileCheck %s --check-prefix=DEFERRED-HFE
+# DEFERRED: JITLink compaction: {{.*}}stub-bytes=24 fallback=0
+# DEFERRED: JITLink stubs: {{.*}}short-adrp=0 long-mov=0 {{.*}}direct-b=6 retained=6 final-bytes=24
+# DEFERRED-HFE: JITLink compaction: {{.*}}stub-bytes=16 fallback=0
+# DEFERRED-HFE: JITLink stubs: {{.*}}short-adrp=0 long-mov=0 {{.*}}direct-b=4 retained=4 final-bytes=16
+
 # CHECK-BOLT: BOLT-INFO: built 3 function fragment cluster(s)
 # CHECK-BOLT-NEXT: BOLT-INFO: cluster: 0
 # CHECK-BOLT-NEXT: BOLT-INFO:   4 fragment(s)

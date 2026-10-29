@@ -39,6 +39,15 @@
 # RUN: llvm-objdump -d --no-show-raw-insn --no-symbolize-operands \
 # RUN:   --section=.text.bolt.extra.1 %t.deferred.bolt | FileCheck %s
 
+## PIE hugify pads the end of the hot code before mapping following sections.
+# RUN: ld.lld --emit-relocs -pie -e _start %t.main.o -o %t.pie
+# RUN: llvm-bolt %t.pie -o %t.pie.bolt --lite=0 --hugify --turn-off-stubs \
+# RUN:   --verify-branch26-range --runtime-hugify-lib=%t.runtime.o \
+# RUN:   | FileCheck %s --check-prefix=PIE
+# PIE: JITLink compaction: {{.*}}stub-bytes=0 fallback=0
+# RUN: llvm-objdump -d --no-show-raw-insn --no-symbolize-operands \
+# RUN:   --section=.text.bolt.extra.1 %t.pie.bolt | FileCheck %s
+
 # STATS: BOLT-INFO: JITLink stubs: slots=0 unused=0 short-adrp=0 long-mov=0
 # STATS-NOT: BOLT-INFO: JITLink stubs:
 # CHECK: [[#%x,BRANCH:]]:{{[ \t]+}}b

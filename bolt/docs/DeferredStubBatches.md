@@ -1,12 +1,13 @@
 # Deferred AArch64 stub placement
 
-The experiment is on `experiment/deferred-stub-creation-mold-batches`, behind
-`--turn-off-stubs`. Its base is `f56d08b25515` (`deferred-stub-creation`).
+This document describes the conservative batch reservation stage behind
+`--turn-off-stubs`. The `experiment/deferred-stub-compaction` branch additionally
+[compacts these reservations before publishing addresses](DeferredStubCompaction.md).
 
 ## Start here
 
 The placement policy is in `AArch64StubPlacer::run` in
-[`JITLinkLinker.cpp`](../lib/Rewrite/JITLinkLinker.cpp). It processes one output
+[`JITLinkAArch64.cpp`](../lib/Rewrite/JITLinkAArch64.cpp). It processes one output
 section with one forward sweep; B, C and D are local indices into its original
 fragment blocks:
 
@@ -30,8 +31,9 @@ in that block. At the end of the batch, allocate exactly its final size and fill
 it with NOPs. No slots means no island. There are no separate reservation offsets,
 second symbol-creation pass, batch objects or saved layout records.
 
-Fall-through guards are wired separately to the next original fragment. The
-last continuation is placed after all tail islands. They do not change batching.
+Fall-through guards are wired separately to the next original fragment's entry,
+skipping any `--pad-funcs-before` prefix. The last continuation is placed after
+all tail islands. They do not change batching.
 
 Excluding proven-direct branches from the capacity estimate avoids needless
 batch splits, but does not guarantee fewer reservations: a larger batch can
@@ -49,8 +51,8 @@ slots are too. Thus no A index or expiration queue is needed. JITLink edges need
 not be ordered, so `reserveBatch` sorts Branch26 pointers without reordering the
 graph's edges.
 
-After final addresses are known, `repairEdges` keeps direct branches or reuses a
-materialized stub by numeric target address, including across output sections.
+Without the compaction extension, `JITLinkAArch64::finalize` keeps direct branches
+or reuses a materialized stub by numeric target address, including across output sections.
 Otherwise it fills the reserved slot with ADRP/ADD/BR or MOV/BR. Unused slots
 remain NOPs. This phase changes neither block sizes nor placement.
 
@@ -60,16 +62,25 @@ There is one owner of each decision:
 
 | Stage | Responsibility |
 | --- | --- |
-| MC emission | Final fragment bytes, internal references and alignments. |
-| `mergeFragmentSections` | Validate relocations, group blocks by logical section and preserve emission order. No byte placement. |
-| Post-prune placement | Assign section-relative block addresses and insert islands; accepted fragments never move again. |
+| MC emission | Final fragment body bytes, internal references and alignments; record the bounded entry alignment separately. |
+| `JITLinkAArch64::mergeFragments` | Validate relocations, group blocks by logical section, preserve emission order and associate blocks with fragment metadata. No byte placement. |
+| Post-prune placement | Apply mandatory block alignment, then bounded entry alignment; assign conservative section-relative addresses and insert islands. |
 | Memory manager | Allocate the resulting extent and copy at those offsets. No packing decisions. |
-| Section mapping | Supply virtual bases; rebase from actual block-buffer positions. |
-| `repairEdges` | Check final distances and fill or reuse slots. No growth or relayout. |
+| Late compaction (experimental) | Preview actual section bases, select final stub sizes, remove unused slots and validate all cross-block Branch26 edges before packing. |
+| Section mapping | Commit virtual bases; rebase from actual block-buffer positions. |
+| `JITLinkAArch64::finalize` (without compaction) | Check final distances and fill or reuse slots. No growth or relayout. |
 
 The 16 MiB allowance is a bound for selecting D, not a prediction of the final
 island size. Every actual slot is checked for reach and capacity. Unplaceable
 indivisible fragments are diagnosed before allocation.
+
+Function entry alignment is not a mandatory block alignment. Private fragment
+sections retain their minimum instruction alignment and any stronger alignment
+required by their already assembled bodies. The logical output section retains
+the section-base alignment. Placement applies the preferred function alignment
+only if its padding fits the main/cold fragment's `MaxAlignmentBytes`; zero
+disables the preference. See [the alignment analysis](DeferredStubAlignment.md)
+for the original code-size defect, measurements and remaining reservation costs.
 
 Block addresses are emission-order keys before placement, section-relative
 offsets before allocation, and virtual addresses after mapping. Unplaced blocks
@@ -80,9 +91,10 @@ offsets. Section order and virtual bases are chosen by `RewriteInstance`.
 It is valid after section-relative placement and before virtual-address rebasing;
 it is not a general query for section contents at any graph stage.
 
-Unlike global `LongJmpPass` relaxation, there is no estimated function layout,
-cluster graph, branch-chain insertion or iterative convergence. Existing local
-basic-block relaxation in `LongJmpPass` still runs inside each fragment.
+The batch sweep uses no estimated function layout or cluster graph. The
+compaction extension can insert branch chains and iterate over the actual linker
+layout before addresses are committed. Existing local basic-block relaxation in
+`LongJmpPass` still runs inside each fragment.
 
 ## Existing per-function sections
 
@@ -119,6 +131,15 @@ materialization. Final ADRP/MOV/unused/shared counts remain controlled by
 `--print-stub-stats`. No additional command-line option is required for batch
 diagnostics. The optional `raw_ostream *Log` parameter lets graph unit tests
 exercise placement without producing informational output.
+
+Each section also reports a `BOLT-INFO: JITLink layout:` summary:
+`total-bytes = emitted-bytes + stub-bytes + alignment-bytes`.
+`emitted-bytes` includes internal MC padding, requested function padding and
+guards; `guard-bytes` is the guard subset of that count. `alignment-bytes` counts
+only gaps between blocks, including island alignment. These counts describe the
+section extent, excluding gaps between different output sections or file-level
+padding. Together with final stub statistics they separate alignment overhead
+from unused reservations.
 
 ## Validation
 

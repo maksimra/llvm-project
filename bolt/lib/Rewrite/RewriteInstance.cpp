@@ -4361,6 +4361,9 @@ void RewriteInstance::emitAndLink() {
   EFMM->setOrgSecPrefix(getOrgSecPrefix());
 
   Linker = std::make_unique<JITLinkLinker>(*BC, std::move(EFMM));
+  if (opts::DoNotUseStubs && BC->isAArch64() && BC->HasRelocations)
+    static_cast<JITLinkLinker &>(*Linker).setSectionPlanner(
+        [this](auto MapSection) { planFileSections(MapSection); });
   Linker->loadObject(ObjectMemBuffer->getMemBufferRef(),
                      [this](auto MapSection) { mapFileSections(MapSection); });
 
@@ -4430,6 +4433,131 @@ void RewriteInstance::updateMetadata() {
 
   if (opts::WriteBoltInfoSection)
     addBoltInfoSection();
+}
+
+namespace {
+
+struct CodeSectionLayout {
+  DenseMap<const BinarySection *, uint64_t> Bases;
+  uint64_t NextAddress, StartAddress = 0, CodeSize = 0, Padding = 0;
+  bool InOldText = false;
+};
+
+/// Shared by the tentative linker layout and the final section mapping.
+/// Remove preassigned sections from Code without changing output metadata.
+CodeSectionLayout layoutCodeSections(BinaryContext &BC,
+                                     std::vector<BinarySection *> &Code,
+                                     uint64_t NextAddress) {
+  CodeSectionLayout Layout{{}, NextAddress};
+  for (const BinarySection *Section : Code)
+    if (Section->getOutputAddress())
+      Layout.Bases[Section] = Section->getOutputAddress();
+  for (const BinaryFunction *Function : BC.getInjectedBinaryFunctions()) {
+    if (!Function->getOutputAddress())
+      continue;
+    if (auto Section = Function->getCodeSection())
+      Layout.Bases[&*Section] = Function->getOutputAddress();
+  }
+  llvm::erase_if(Code, [&](const auto *Section) {
+    return Layout.Bases.contains(Section);
+  });
+  const StringRef LastHot = BC.HasWarmSection ? BC.getWarmCodeSectionName()
+                                              : BC.getMainCodeSectionName();
+  auto AllocateAt = [&](uint64_t Address) {
+    for (const BinarySection *Section : Code) {
+      Address = alignTo(Address, Section->getAlignment());
+      Layout.Bases[Section] = Address;
+      Address += Section->getOutputSize();
+      // PIE hugify also reserves the remainder of the last hot huge page.
+      if (opts::Hugify && !BC.HasFixedLoadAddress &&
+          Section->getName() == LastHot)
+        Address = alignTo(Address, Section->getAlignment());
+    }
+    auto Hot = BC.getUniqueSectionByName(LastHot);
+    if (opts::HotText && Hot && Hot->hasValidSectionID()) {
+      const uint64_t End = alignTo(
+          Layout.Bases.lookup(&*Hot) + Hot->getOutputSize(), BC.PageAlign);
+      if (End > Address) {
+        Layout.Padding = End - Address;
+        Address = End;
+      }
+    }
+    return Address;
+  };
+  if (opts::UseOldText) {
+    uint64_t Start = BC.OldTextSectionAddress;
+    uint64_t End = Start;
+    if (opts::HotFunctionsAtEnd) {
+      End += BC.OldTextSectionSize;
+      Start = End;
+      for (const BinarySection *Section : llvm::reverse(Code)) {
+        if (Section->getOutputSize() > Start) {
+          Start = 0;
+          break;
+        }
+        Start = alignDown(Start - Section->getOutputSize(),
+                          Section->getAlignment());
+        Layout.Bases[Section] = Start;
+      }
+    } else {
+      End = AllocateAt(Start);
+    }
+    Layout.StartAddress = Start;
+    Layout.CodeSize = End - Start;
+    Layout.InOldText = Layout.CodeSize <= BC.OldTextSectionSize;
+  }
+  if (!Layout.InOldText)
+    Layout.NextAddress = AllocateAt(NextAddress);
+  return Layout;
+}
+
+} // namespace
+
+void RewriteInstance::planFileSections(BOLTLinker::SectionMapper MapSection) {
+  auto Code = getCodeSections();
+  auto Layout = layoutCodeSections(*BC, Code, NextAvailableAddress);
+  auto &Addresses = Layout.Bases;
+  uint64_t Address = Layout.NextAddress;
+
+  const BinarySection *Skip = nullptr;
+  if (auto *Relocated = getSection(".relocated" + getEHFrameSectionName()))
+    if (Relocated->hasValidSectionID()) {
+      const auto *New = getSection(getNewSecPrefix() + getEHFrameSectionName());
+      if (!New || !New->isFinalized())
+        Skip = Relocated;
+    }
+  // Mirror in-place exception-table allocation without padding or renaming.
+  if ((opts::UseOldText && Layout.InOldText) || opts::StrictMode) {
+    auto InPlace = [&](const BinarySection *Old, const BinarySection *New) {
+      if (Old && New && Old->getSize() >= New->getOutputSize())
+        Addresses[New] = Old->getAddress();
+    };
+    InPlace(EHFrameSection ? &*EHFrameSection : nullptr,
+            getSection(getNewSecPrefix() + getEHFrameSectionName()));
+    InPlace(getSection(".gcc_except_table"),
+            getSection(getNewSecPrefix() + ".gcc_except_table"));
+  }
+  for (bool Writable : {false, true}) {
+    if (Writable)
+      Address = alignTo(Address, BC->RegularPageSize);
+    for (const BinarySection &Section : BC->allocatableSections()) {
+      if (&Section == Skip || Section.isLinkOnly() ||
+          !Section.hasValidSectionID() || Section.isWritable() != Writable ||
+          Addresses.contains(&Section))
+        continue;
+      if (Section.getOutputAddress())
+        Addresses[&Section] = Section.getOutputAddress();
+      else if (Section.hasSectionRef())
+        Addresses[&Section] = Section.getAddress();
+      else {
+        Address = alignTo(Address, Section.getAlignment());
+        Addresses[&Section] = Address;
+        Address += Section.getOutputSize();
+      }
+    }
+  }
+  for (const auto &[Section, Base] : Addresses)
+    MapSection(*Section, Base);
 }
 
 void RewriteInstance::mapFileSections(BOLTLinker::SectionMapper MapSection) {
@@ -4529,96 +4657,32 @@ void RewriteInstance::mapCodeSections(BOLTLinker::SectionMapper MapSection) {
   // Populate the list of sections to be allocated.
   std::vector<BinarySection *> CodeSections = getCodeSections();
 
-  // Remove sections that were pre-allocated (patch sections).
-  llvm::erase_if(CodeSections, [](BinarySection *Section) {
-    return Section->getOutputAddress();
-  });
+  auto Layout = layoutCodeSections(*BC, CodeSections, NextAvailableAddress);
+  for (BinarySection *Section : CodeSections)
+    Section->setOutputAddress(Layout.Bases.lookup(Section));
+  NextAvailableAddress = Layout.NextAddress;
   LLVM_DEBUG(dbgs() << "Code sections in the order of output:\n";
              for (const BinarySection *Section : CodeSections) dbgs()
              << Section->getName() << '\n';);
 
-  uint64_t PaddingSize = 0; // size of padding required at the end
-
-  // Allocate sections starting at a given Address.
-  auto allocateAt = [&](uint64_t Address) {
-    const char *LastNonColdSectionName = BC->HasWarmSection
-                                             ? BC->getWarmCodeSectionName()
-                                             : BC->getMainCodeSectionName();
-    for (BinarySection *Section : CodeSections) {
-      Address = alignTo(Address, Section->getAlignment());
-      Section->setOutputAddress(Address);
-      Address += Section->getOutputSize();
-
-      // Hugify: Additional huge page from right side due to
-      // weird ASLR mapping addresses (4KB aligned)
-      if (opts::Hugify && !BC->HasFixedLoadAddress &&
-          Section->getName() == LastNonColdSectionName)
-        Address = alignTo(Address, Section->getAlignment());
-    }
-
-    // Make sure we allocate enough space for huge pages.
-    ErrorOr<BinarySection &> TextSection =
-        BC->getUniqueSectionByName(LastNonColdSectionName);
-    if (opts::HotText && TextSection && TextSection->hasValidSectionID()) {
-      uint64_t HotTextEnd =
-          TextSection->getOutputAddress() + TextSection->getOutputSize();
-      HotTextEnd = alignTo(HotTextEnd, BC->PageAlign);
-      if (HotTextEnd > Address) {
-        PaddingSize = HotTextEnd - Address;
-        Address = HotTextEnd;
-      }
-    }
-    return Address;
-  };
-
-  // Try to allocate sections before the \p Address and return an address for
-  // the allocation of the first section, or 0 if [0, Address) range is not
-  // big enough to fit all sections.
-  auto allocateBefore = [&](uint64_t Address) -> uint64_t {
-    for (BinarySection *Section : llvm::reverse(CodeSections)) {
-      if (Section->getOutputSize() > Address)
-        return 0;
-      Address -= Section->getOutputSize();
-      Address = alignDown(Address, Section->getAlignment());
-      Section->setOutputAddress(Address);
-    }
-    return Address;
-  };
-
-  // Check if we can fit code in the original .text
-  bool AllocationDone = false;
   if (opts::UseOldText) {
-    uint64_t StartAddress;
-    uint64_t EndAddress;
-    if (opts::HotFunctionsAtEnd) {
-      EndAddress = BC->OldTextSectionAddress + BC->OldTextSectionSize;
-      StartAddress = allocateBefore(EndAddress);
-    } else {
-      StartAddress = BC->OldTextSectionAddress;
-      EndAddress = allocateAt(BC->OldTextSectionAddress);
-    }
-
-    const uint64_t CodeSize = EndAddress - StartAddress;
-    if (CodeSize <= BC->OldTextSectionSize) {
+    if (Layout.InOldText) {
       BC->outs() << "BOLT-INFO: using original .text for new code with 0x"
                  << Twine::utohexstr(BC->AlignText) << " alignment";
-      if (StartAddress != BC->OldTextSectionAddress)
-        BC->outs() << " at 0x" << Twine::utohexstr(StartAddress);
+      if (Layout.StartAddress != BC->OldTextSectionAddress)
+        BC->outs() << " at 0x" << Twine::utohexstr(Layout.StartAddress);
       BC->outs() << '\n';
-      AllocationDone = true;
     } else {
       BC->errs() << "BOLT-WARNING: --use-old-text failed. The original .text "
                     "too small to fit the new code using 0x"
                  << Twine::utohexstr(BC->AlignText) << " alignment. "
-                 << CodeSize << " bytes needed, have " << BC->OldTextSectionSize
+                 << Layout.CodeSize << " bytes needed, have "
+                 << BC->OldTextSectionSize
                  << " bytes available. Rebuilding without --use-old-text may "
                     "produce a smaller binary\n";
       opts::UseOldText = false;
     }
   }
-
-  if (!AllocationDone)
-    NextAvailableAddress = allocateAt(NextAvailableAddress);
 
   // Do the mapping for ORC layer based on the allocation.
   for (BinarySection *Section : CodeSections) {
@@ -4632,7 +4696,7 @@ void RewriteInstance::mapCodeSections(BOLTLinker::SectionMapper MapSection) {
   }
 
   // Check if we need to insert a padding section for hot text.
-  if (PaddingSize && !opts::UseOldText)
+  if (Layout.Padding && !opts::UseOldText)
     BC->outs() << "BOLT-INFO: padding code to 0x"
                << Twine::utohexstr(NextAvailableAddress)
                << " to accommodate hot text\n";

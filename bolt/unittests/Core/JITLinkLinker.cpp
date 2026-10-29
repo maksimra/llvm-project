@@ -8,6 +8,7 @@
 
 #include "bolt/Rewrite/JITLinkLinker.h"
 #include "bolt/Core/BinaryContext.h"
+#include "bolt/Rewrite/JITLinkAArch64.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/JITLink/aarch64.h"
 #include "llvm/Support/MathExtras.h"
@@ -84,13 +85,13 @@ protected:
                                     Linkage::Strong, Scope::Default, true);
   unsigned Order = 0;
 
-  Expected<std::vector<JITLinkLinker::AArch64Stub>>
+  Expected<std::vector<JITLinkAArch64::Stub>>
   reserve(const DenseSet<Block *> &FallThroughBlocks = {}) {
     EmittedFragmentSection Guard{"", "", 1, true};
-    JITLinkLinker::FragmentMap FragmentsByBlock;
+    JITLinkAArch64::FragmentMap FragmentsByBlock;
     for (const auto *Block : FallThroughBlocks)
       FragmentsByBlock[Block] = &Guard;
-    return JITLinkLinker::reserveAArch64Stubs(G, FragmentsByBlock);
+    return JITLinkAArch64::reserveStubs(G, FragmentsByBlock);
   }
 
   Block &block(uint64_t Size, uint64_t Alignment = 4,
@@ -106,7 +107,7 @@ protected:
     B.addEdge(aarch64::Branch26PCRel, Offset, Target, Addend);
   }
 
-  void checkReachability(ArrayRef<JITLinkLinker::AArch64Stub> Stubs) {
+  void checkReachability(ArrayRef<JITLinkAArch64::Stub> Stubs) {
     for (const auto &Stub : Stubs)
       for (const auto &Branch : Stub.Branches)
         EXPECT_TRUE(isInt<28>(
@@ -186,9 +187,8 @@ TEST_F(AArch64StubBatchTest, RejectSplitEmittedFragment) {
   G.createContentBlock(Input, ArrayRef<char>("bbbb", 4), orc::ExecutorAddr(4),
                        4, 0);
   EmittedFragmentSection Fragment{".bolt.fragment.0", ".text", 4, false};
-  JITLinkLinker::FragmentMap FragmentsByBlock;
-  auto Err =
-      JITLinkLinker::mergeFragmentSections(G, {Fragment}, FragmentsByBlock);
+  JITLinkAArch64::FragmentMap FragmentsByBlock;
+  auto Err = JITLinkAArch64::mergeFragments(G, {Fragment}, FragmentsByBlock);
   ASSERT_TRUE(bool(Err));
   EXPECT_NE(toString(std::move(Err)).find("Expected one block"),
             std::string::npos);
@@ -219,7 +219,7 @@ TEST_F(AArch64StubBatchTest, DirectBranchesDoNotConsumeIslandBudget) {
 
   std::string Log;
   raw_string_ostream OS(Log);
-  auto Stubs = JITLinkLinker::reserveAArch64Stubs(G, {}, &OS);
+  auto Stubs = JITLinkAArch64::reserveStubs(G, {}, &OS);
   ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
   EXPECT_TRUE(Stubs->empty());
   EXPECT_NE(Log.find("batches=1 fragments=2 islands=0 slots=0"),
@@ -235,11 +235,11 @@ TEST_F(AArch64StubBatchTest, BoundedEntryAlignmentPreservesBodyAlignment) {
   EmittedFragmentSection Preferred{"", "", 1, false, 64, 32};
   EmittedFragmentSection NoPadding{"", "", 1, false, 64, 0};
   EmittedFragmentSection SmallBudget{"", "", 1, false, 64, 4};
-  JITLinkLinker::FragmentMap FragmentsByBlock{{&Skip, &Preferred},
-                                              {&AtLimit, &Preferred},
-                                              {&Disabled, &NoPadding},
-                                              {&Body, &SmallBudget}};
-  auto Stubs = JITLinkLinker::reserveAArch64Stubs(G, FragmentsByBlock);
+  JITLinkAArch64::FragmentMap FragmentsByBlock{{&Skip, &Preferred},
+                                               {&AtLimit, &Preferred},
+                                               {&Disabled, &NoPadding},
+                                               {&Body, &SmallBudget}};
+  auto Stubs = JITLinkAArch64::reserveStubs(G, FragmentsByBlock);
   ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
   EXPECT_TRUE(Stubs->empty());
   EXPECT_EQ(Skip.getAddress().getValue(), 4u);     // 60 exceeds the budget.

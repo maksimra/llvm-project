@@ -9,6 +9,7 @@
 #include "bolt/Rewrite/ExecutableFileMemoryManager.h"
 #include "bolt/Rewrite/JITLinkLinker.h"
 #include "bolt/Rewrite/RewriteInstance.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/Support/MemAlloc.h"
 
@@ -71,8 +72,10 @@ struct AllocInfo {
       deallocate_buffer(Section.Address, Section.Size, Section.Alignment);
   }
 
-  SectionAllocInfo allocateSection(const jitlink::Section &Section) {
-    auto Size = JITLinkLinker::getSectionAllocationSize(Section);
+  SectionAllocInfo allocateSection(const jitlink::Section &Section,
+                                   uint64_t ExtraCapacity = 0) {
+    auto Size =
+        JITLinkLinker::getSectionAllocationSize(Section) + ExtraCapacity;
     auto Alignment = sectionAlignment(Section);
     auto *Buf = allocate_buffer(Size, Alignment);
     SectionAllocInfo Alloc{Buf, Size, Alignment};
@@ -201,14 +204,24 @@ void ExecutableFileMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
                                            jitlink::LinkGraph &G,
                                            OnAllocatedFunction OnAllocated) {
   auto Alloc = std::make_unique<AllocInfo>();
+  uint64_t StubCapacity = 0;
+  if (!ObjectsLoaded && opts::DoNotUseStubs && BC.isELF() && BC.isAArch64() &&
+      BC.HasRelocations)
+    for (const auto *Symbol : G.defined_symbols())
+      if (!Symbol->hasName() && Symbol->isCallable() && Symbol->getSize() == 20)
+        StubCapacity += 20;
 
   for (auto *Section : orderedSections(G)) {
     if (Section->empty())
       continue;
 
-    auto SectionAlloc = Alloc->allocateSection(*Section);
+    const bool Executable =
+        (Section->getMemProt() & orc::MemProt::Exec) != orc::MemProt::None;
+    auto SectionAlloc =
+        Alloc->allocateSection(*Section, Executable ? StubCapacity : 0);
     updateSection(*Section, static_cast<uint8_t *>(SectionAlloc.Address),
-                  SectionAlloc.Size, SectionAlloc.Alignment);
+                  JITLinkLinker::getSectionAllocationSize(*Section),
+                  SectionAlloc.Alignment);
 
     copySectionContents(*Section, static_cast<char *>(SectionAlloc.Address));
   }

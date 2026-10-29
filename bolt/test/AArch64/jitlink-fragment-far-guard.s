@@ -31,8 +31,6 @@
 # CHECK-NEXT: {{0*}}[[#STUB]]: adrp x16, 0x[[#%x,DEST:]]
 # CHECK-NEXT: add x16, x16, #0x[[#%x,DEST_LO:]]
 # CHECK-NEXT: br x16
-# CHECK-NEXT: nop
-# CHECK-NEXT: nop
 # CHECK: {{0*}}[[#DEST + DEST_LO]] <second>:
 # CHECK-NEXT: ret
 

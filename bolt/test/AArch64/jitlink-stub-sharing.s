@@ -27,7 +27,7 @@
 # RUN:   --align-functions=16 --pad-funcs-before=callee:134217984 \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=FAR
-# FAR: BOLT-INFO: JITLink stubs: slots=2 unused=0 short-adrp=2 long-mov=0 shared=4
+# FAR: BOLT-INFO: JITLink stubs: slots={{[0-9]+}} unused={{[0-9]+}} short-adrp=2 long-mov=0 shared=4 direct-b=0 retained=2 final-bytes=24
 # RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=_start,second \
 # RUN:   %t.far | FileCheck %s --check-prefixes=SHARED,SHORT
 
@@ -62,13 +62,9 @@
 # SHORT-NEXT: {{0*}}[[#STUB]]: adrp x16,
 # SHORT-NEXT: add x16, x16, #0x[[#%x,TARGET_LO:]]
 # SHORT-NEXT: br x16
-# SHORT-NEXT: nop
-# SHORT-NEXT: nop
 # SHORT-NEXT: {{0*}}[[#OFFSET_STUB]]: adrp x16,
 # SHORT-NEXT: add x16, x16, #0x[[#TARGET_LO + 4]]
 # SHORT-NEXT: br x16
-# SHORT-NEXT: nop
-# SHORT-NEXT: nop
 # LONG-NEXT: {{0*}}[[#STUB]]: mov x16, #0x[[#%x,TARGET_LO:]]
 # LONG-NEXT: movk x16, #0x[[#%x,TARGET_HI:]], lsl #16
 # LONG-NEXT: movk x16, #0x0, lsl #32
@@ -94,25 +90,25 @@
 # SEPARATED-CODE-LABEL: <_start>:
 # SEPARATED-CODE-NEXT: bl 0x[[#%x,FIRST_STUB:]]
 # SEPARATED-CODE-NEXT: bl 0x[[#FIRST_STUB]]
-# SEPARATED-CODE-NEXT: bl 0x[[#FIRST_STUB + 20]]
+# SEPARATED-CODE-NEXT: bl 0x[[#FIRST_STUB + 12]]
 # SEPARATED-CODE-NEXT: b 0x[[#FIRST_STUB]]
 # SEPARATED-CODE: [[#%x,SECOND:]] <second>:
 # SEPARATED-CODE-NEXT: bl 0x[[#SECOND + 8]]
-# SEPARATED-CODE-NEXT: b 0x[[#SECOND + 28]]
+# SEPARATED-CODE-NEXT: b 0x[[#SECOND + 20]]
 
 ## The negative Branch26 limit is inclusive. Increasing this padding by four
 ## bytes makes only second's last branch unable to reach its original slot.
 # RUN: llvm-bolt %t.exe -o %t.boundary --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 \
-# RUN:   --pad-funcs-before=second:134217684,callee:134217984 \
+# RUN:   --pad-funcs-before=second:134217700,callee:134217984 \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=FAR
 # RUN: llvm-bolt %t.exe -o %t.beyond --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 \
-# RUN:   --pad-funcs-before=second:134217688,callee:134217984 \
+# RUN:   --pad-funcs-before=second:134217704,callee:134217984 \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=BEYOND
-# BEYOND: BOLT-INFO: JITLink stubs: slots=3 unused=0 short-adrp=3 long-mov=0 shared=3
+# BEYOND: BOLT-INFO: JITLink stubs: slots={{[0-9]+}} unused={{[0-9]+}} short-adrp=3 long-mov=0 shared=3 direct-b=0 retained=3 final-bytes=36
 
 .text
 .globl _start

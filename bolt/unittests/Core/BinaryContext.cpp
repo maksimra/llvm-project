@@ -7,9 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Core/BinaryContext.h"
+#include "bolt/Rewrite/JITLinkAArch64.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
+#include "llvm/ExecutionEngine/JITLink/aarch64.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
@@ -88,6 +90,54 @@ INSTANTIATE_TEST_SUITE_P(RISCV, BinaryContextTester,
 
 INSTANTIATE_TEST_SUITE_P(AArch64, BinaryContextTester,
                          ::testing::Values(Triple::aarch64));
+
+TEST_P(BinaryContextTester, CompactionPreservesAlignmentSensitiveDirectBranch) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  using namespace jitlink;
+  constexpr uint64_t Limit = 128 * 1024 * 1024;
+  constexpr uint64_t Base = 0x800000;
+  LinkGraph G("compact", std::make_shared<orc::SymbolStringPool>(),
+              Triple("aarch64-unknown-linux"), 8, SubtargetFeatures(),
+              aarch64::getEdgeKindName);
+  auto &Text =
+      G.createSection(".text", orc::MemProt::Read | orc::MemProt::Exec);
+  auto Buffer = G.allocateBuffer(Limit + 68);
+  memset(Buffer.data(), 0, Buffer.size());
+  auto &Prefix = G.createMutableContentBlock(Text, Buffer.take_front(48),
+                                             orc::ExecutorAddr(0), 4, 0);
+  auto &Island = G.createMutableContentBlock(Text, Buffer.slice(48, 20),
+                                             orc::ExecutorAddr(48), 4, 0);
+  auto &Source = G.createMutableContentBlock(Text, Buffer.slice(68, 8),
+                                             orc::ExecutorAddr(68), 4, 0);
+  G.createMutableContentBlock(Text, Buffer.slice(76, Limit - 16),
+                              orc::ExecutorAddr(76), 4, 0);
+  auto &Callee = G.createMutableContentBlock(
+      Text, Buffer.slice(Limit + 64, 4), orc::ExecutorAddr(Limit + 64), 64, 0);
+  auto &Far = G.addAbsoluteSymbol("far", orc::ExecutorAddr(0x40000000), 0,
+                                  Linkage::Strong, Scope::Default, true);
+  auto &Target = G.addAnonymousSymbol(Callee, 0, 4, true, true);
+  auto &Slot = G.addAnonymousSymbol(Island, 0, 20, true, true);
+  Prefix.addEdge(aarch64::Branch26PCRel, 0, Far, 0);
+  Source.addEdge(aarch64::Branch26PCRel, 0, Target, 0);
+  auto &Section = BC->registerOrUpdateSection(
+      ".text", ELF::SHT_PROGBITS, ELF::SHF_ALLOC | ELF::SHF_EXECINSTR,
+      reinterpret_cast<uint8_t *>(Buffer.data()), Buffer.size(), 64);
+  Section.setSectionID(".text");
+  JITLinkAArch64::Stub Reservation{&Slot, {{&Prefix, 0}}};
+  auto Err = JITLinkAArch64::compactStubs(
+      *BC, G, {Reservation}, {},
+      [&](BOLTLinker::SectionMapper Map) { Map(Section, Base); },
+      [](StringRef, const auto *) { return 0; });
+  ASSERT_FALSE(bool(Err)) << toString(std::move(Err));
+  // Shrinking 20 -> 12 would move Source back eight bytes while Callee stays
+  // aligned at the same address: +128 MiB - 4 would become +128 MiB + 4.
+  EXPECT_EQ(Source.getAddress().getValue(), 68u);
+  EXPECT_EQ(Callee.getAddress().getValue() - Source.getAddress().getValue(),
+            Limit - 4);
+  EXPECT_EQ(Island.getSize(), 20u);
+  BC->outs().flush();
+}
 
 TEST_P(BinaryContextTester, FlushPendingRelocCALL26) {
   if (GetParam() != Triple::aarch64)

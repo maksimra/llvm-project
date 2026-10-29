@@ -26,8 +26,6 @@
 # CHECK-NEXT: {{0*}}[[#STUB]]: adrp x16,
 # CHECK-NEXT: add x16, x16,
 # CHECK-NEXT: br x16
-# CHECK-NEXT: nop
-# CHECK-NEXT: nop
 # CHECK-LABEL: <third>:
 # CHECK-NEXT: b 0x[[#STUB]]
 

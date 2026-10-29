@@ -29,9 +29,8 @@
 # CHECK-NEXT: b 0x[[#%x,LAST:]] <last>
 # CHECK-NOT: nop
 
-## The final guard keeps a conservative reservation for the section-end marker,
-## which is placed after the tail island.
+## The final guard reaches the section-end marker. Its unused reservation
+## is removed during compaction.
 # CHECK: {{0*}}[[#LAST]] <last>:
 # CHECK-NEXT: bl {{.*}} <callee>
-# CHECK-NEXT: b 0x[[#LAST + 28]]
-# CHECK-COUNT-5: nop
+# CHECK-NEXT: b 0x[[#LAST + 8]]
