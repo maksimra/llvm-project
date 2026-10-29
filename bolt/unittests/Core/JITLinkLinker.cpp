@@ -205,6 +205,27 @@ TEST_F(AArch64StubBatchTest, SkipProvenDirectBranches) {
   EXPECT_TRUE(Stubs->empty());
 }
 
+TEST_F(AArch64StubBatchTest, DirectBranchesDoNotConsumeIslandBudget) {
+  // One more branch than a 16 MiB island could hold in 20-byte slots. All
+  // targets are already placed and reachable, so the two fragments should
+  // remain in one batch without reserving any slots.
+  constexpr unsigned MaxSlots = 16 * MiB / 20;
+  auto &Dense = block(4 * MaxSlots);
+  auto &Caller = block(4);
+  auto &Target = G.addAnonymousSymbol(Dense, 0, 4, true, true);
+  for (unsigned I = 0; I < MaxSlots; ++I)
+    branch(Dense, 4 * I, Target);
+  branch(Caller, 0, Target);
+
+  std::string Log;
+  raw_string_ostream OS(Log);
+  auto Stubs = JITLinkLinker::reserveAArch64Stubs(G, {}, &OS);
+  ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
+  EXPECT_TRUE(Stubs->empty());
+  EXPECT_NE(Log.find("batches=1 fragments=2 islands=0 slots=0"),
+            std::string::npos);
+}
+
 TEST_F(AArch64StubBatchTest, BoundedEntryAlignmentPreservesBodyAlignment) {
   block(4);
   auto &Skip = block(28);

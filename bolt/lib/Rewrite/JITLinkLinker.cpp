@@ -678,17 +678,18 @@ public:
         ++D;
       }
 
-      // Select C by code size and worst-case slot count. Keep large fragments
+      // Select C by code size and an upper bound on slots for branches not
+      // already proven direct in the placed prefix. Keep large fragments
       // whole; reserveBatch checks every actual slot's reach and island size.
       size_t C = B + 1;
-      uint64_t NumBranches = countBranches(*Blocks[B]);
+      uint64_t NumCandidates = countStubCandidates(*Blocks[B]);
       while (C < D &&
              Blocks[C]->getAddress().getValue() + Blocks[C]->getSize() <
                  Blocks[B]->getAddress().getValue() + BatchSize) {
-        const uint64_t Next = countBranches(*Blocks[C]);
-        if (NumBranches + Next > MaxIslandSize / StubSize)
+        const uint64_t Next = countStubCandidates(*Blocks[C]);
+        if (NumCandidates + Next > MaxIslandSize / StubSize)
           break;
-        NumBranches += Next;
+        NumCandidates += Next;
         ++C;
       }
       const auto Batch = ArrayRef(Blocks).slice(B, C - B);
@@ -742,9 +743,11 @@ private:
     return Offset + Block.getSize();
   }
 
-  static uint64_t countBranches(const jitlink::Block &Block) {
-    return llvm::count_if(Block.edges(), [](const auto &Edge) {
-      return Edge.getKind() == jitlink::aarch64::Branch26PCRel;
+  uint64_t countStubCandidates(const jitlink::Block &Block) const {
+    return llvm::count_if(Block.edges(), [&](const auto &Edge) {
+      return Edge.getKind() == jitlink::aarch64::Branch26PCRel &&
+             !isProvenDirect(Edge,
+                             Block.getAddress().getValue() + Edge.getOffset());
     });
   }
 

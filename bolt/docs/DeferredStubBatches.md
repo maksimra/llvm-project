@@ -16,8 +16,10 @@ B [current batch] C [placed look-ahead] [new island] D [unplaced fragments]
 
 1. Advance D, placing whole fragments while leaving a 16 MiB island allowance
    within Branch26 range (128 MiB) of B. At least one fragment is accepted.
-2. Select C: approximately 32 MiB of code, also bounded by the worst-case number
-   of 20-byte stub slots. A large fragment remains indivisible.
+2. Select C: approximately 32 MiB of code, also bounded by the number of branches
+   not proven direct in the already placed prefix, at 20 bytes per candidate.
+   This is an upper bound: sharing can further reduce the slots actually needed.
+   A large fragment remains indivisible.
 3. `reserveBatch` visits B..C in source-address order. A proven direct branch
    needs nothing; otherwise reuse a reachable slot or append one to this batch's
    island at D. Advance B to C.
@@ -30,6 +32,11 @@ second symbol-creation pass, batch objects or saved layout records.
 
 Fall-through guards are wired separately to the next original fragment. The
 last continuation is placed after all tail islands. They do not change batching.
+
+Excluding proven-direct branches from the capacity estimate avoids needless
+batch splits, but does not guarantee fewer reservations: a larger batch can
+process later sources before the next iteration advances D to their targets.
+The 32 MiB code limit and the 16 MiB look-ahead island allowance still apply.
 
 ## Sharing and mold's A window
 
