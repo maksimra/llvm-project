@@ -280,17 +280,45 @@ TEST_F(AArch64StubBatchTest, AlignmentGapsAndEmptyMarkers) {
   EXPECT_LT(llvm::find(Ordered, &Empty), llvm::find(Ordered, &Aligned));
 }
 
+TEST_F(AArch64StubBatchTest, LastGuardNeedsNoSlot) {
+  auto &Caller = block(8);
+  auto Stubs = reserve({&Caller});
+  ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
+  EXPECT_TRUE(Stubs->empty());
+  ASSERT_EQ(Caller.edges_size(), 1u);
+  auto &Guard = *Caller.edges().begin();
+  EXPECT_EQ(Guard.getOffset(), 4u);
+  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 8u);
+  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), 8u);
+}
+
 TEST_F(AArch64StubBatchTest, LastGuardSkipsTailIsland) {
   auto &Caller = G.createMutableContentBlock(Text, G.allocateBuffer(8),
                                              orc::ExecutorAddr(0), 4, 0);
   branch(Caller, 0, Far);
   auto Stubs = reserve({&Caller});
   ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
-  ASSERT_EQ(Stubs->size(), 2u);
+  ASSERT_EQ(Stubs->size(), 1u);
   checkReachability(*Stubs);
   auto &Guard = *std::next(Caller.edges().begin());
   EXPECT_EQ(Guard.getOffset(), 4u);
-  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 48u);
+  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 28u);
+  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), 28u);
+}
+
+TEST_F(AArch64StubBatchTest, LastGuardSkipsTailIslandsFromEarlierBatches) {
+  SmallVector<Block *> Callers;
+  for (unsigned I = 0; I != 4; ++I) {
+    Callers.push_back(&block(16 * MiB));
+    branch(*Callers.back(), 0, Far, 4 * I);
+  }
+  auto Stubs = reserve({Callers.back()});
+  ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
+  ASSERT_EQ(Stubs->size(), 4u);
+  checkReachability(*Stubs);
+  auto &Guard = *std::next(Callers.back()->edges().begin());
+  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 64 * MiB + 80);
+  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), 64 * MiB + 80);
 }
 
 } // namespace

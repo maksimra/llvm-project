@@ -22,7 +22,7 @@
 # CHECK-NEXT: bl {{.*}} <callee>
 # CHECK-NEXT: {{0*}}[[#LAST + 4]]: b
 
-## The FDE ends immediately after the guard, before the reserved slot.
+## The FDE ends immediately after the guard.
 ## No later CFI row may change the CFA/LR rules before the guard executes.
 # CHECK: FDE cie={{.*}} pc={{0*}}[[#START]]...{{0*}}[[#START + 16]]
 # CHECK: 0x[[#START + 8]]: CFA=WSP+16: W30=[CFA-8]

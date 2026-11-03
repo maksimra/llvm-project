@@ -31,7 +31,9 @@ it with NOPs. No slots means no island. There are no separate reservation offset
 second symbol-creation pass, batch objects or saved layout records.
 
 Fall-through guards are wired separately to the next original fragment. The
-last continuation is placed after all tail islands. They do not change batching.
+section-end guard is the last branch processed: all other slots have already
+been reserved, so its continuation can be placed at their exact end before the
+direct-range check. It needs no speculative slot or additional layout pass.
 
 Excluding proven-direct branches from the capacity estimate avoids needless
 batch splits, but does not guarantee fewer reservations: a larger batch can

@@ -602,7 +602,7 @@ Error JITLinkLinker::mergeFragmentSections(
 namespace {
 
 /// Guards jump to the next original fragment, over any intervening islands.
-/// The last continuation is placed after all tail islands by the caller.
+/// The last continuation is placed when its guard is processed.
 jitlink::Block *
 addFallThroughGuards(jitlink::LinkGraph &G, ArrayRef<jitlink::Block *> Blocks,
                      const JITLinkLinker::FragmentMap &FragmentsByBlock) {
@@ -694,14 +694,12 @@ public:
       }
       const auto Batch = ArrayRef(Blocks).slice(B, C - B);
       const size_t FirstNewStub = Stubs.size();
-      if (Error Err = reserveBatch(Batch, Offset))
+      if (Error Err = reserveBatch(Batch, Offset, EndMarker))
         return Err;
       ++NumBatches;
       NumIslands += Stubs.size() != FirstNewStub;
       B = C;
     }
-    if (EndMarker)
-      JITLinkLinker::layoutBlocks({EndMarker}, Offset);
     if (Log) {
       uint64_t EmittedBytes = 0, GuardBytes = 0;
       for (const auto *Block : Blocks) {
@@ -759,7 +757,8 @@ private:
                (Target.getAddress() + Edge.getAddend()).getValue() - Source));
   }
 
-  Error reserveBatch(ArrayRef<jitlink::Block *> Blocks, uint64_t &Offset) {
+  Error reserveBatch(ArrayRef<jitlink::Block *> Blocks, uint64_t &Offset,
+                     jitlink::Block *EndMarker) {
     const uint64_t IslandOffset = alignTo(Offset, 4);
     jitlink::Block *Island = nullptr;
     SmallVector<const jitlink::Edge *, 8> Branches;
@@ -776,6 +775,13 @@ private:
       for (const auto *Edge : Branches) {
         const uint64_t Source =
             Block->getAddress().getValue() + Edge->getOffset();
+        if (Edge->getTarget().isDefined() &&
+            &Edge->getTarget().getBlock() == EndMarker) {
+          // The section-end guard is the last edge of the last batch. All
+          // other reservations are final, so its target can be placed now.
+          JITLinkLinker::layoutBlocks(
+              {EndMarker}, Island ? IslandOffset + Island->getSize() : Offset);
+        }
         if (isProvenDirect(*Edge, Source))
           continue;
         auto [It, Inserted] =
