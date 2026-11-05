@@ -1785,6 +1785,9 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
           opts::SplitStrategy != opts::SplitFunctionsStrategy::CDSplit) &&
          "LongJmp cannot work with functions split in more than two fragments");
 
+  if (usesDeferredStubs(BC) && BC.usesBTI())
+    prepareDeferredBTITargets(BC);
+
   DenseMap<BinaryFunction *, BranchLivenessInfo> BranchLiveness;
 
   if (opts::FixBranchesWithLiveness) {

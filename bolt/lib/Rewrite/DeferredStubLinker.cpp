@@ -8,10 +8,12 @@
 
 #include "bolt/Rewrite/DeferredStubLinker.h"
 #include "bolt/Core/BinaryContext.h"
+#include "bolt/Core/BinarySection.h"
 #include "bolt/Rewrite/JITLinkLinker.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ExecutionEngine/JITLink/aarch64.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MathExtras.h"
@@ -31,6 +33,69 @@ AArch64StubTarget getAArch64StubTarget(const jitlink::Edge &Edge) {
   if (Target.isAbsolute())
     return {nullptr, (Target.getAddress() + Edge.getAddend()).getValue()};
   return {&Target.getAddressable(), Target.getOffset() + Edge.getAddend()};
+}
+
+/// Check the actual indirect destination, not just its symbol's entry. Only a
+/// NOP may be replaced here: allocation and all symbol addresses are final.
+Error ensureAArch64BTITarget(BinaryContext &BC,
+                             ArrayRef<jitlink::Block *> CodeBlocks,
+                             uint64_t Address) {
+  jitlink::Block *Block = nullptr;
+  BinarySection *Section = nullptr;
+  ArrayRef<char> Content;
+  uint64_t Offset = 0;
+  auto It = llvm::upper_bound(CodeBlocks, Address, [](uint64_t Addr, auto *B) {
+    return Addr < B->getAddress().getValue();
+  });
+  if (It != CodeBlocks.begin()) {
+    auto *Candidate = *std::prev(It);
+    Offset = Address - Candidate->getAddress().getValue();
+    if (Offset < Candidate->getSize()) {
+      Block = Candidate;
+      if (!Block->isZeroFill())
+        Content = Block->getContent();
+    }
+  }
+  if (!Block) {
+    // Skipped functions and PLT entries remain in the input code sections.
+    auto Original = BC.getSectionForAddress(Address);
+    if (Original && Original->hasSectionRef() && Original->isText()) {
+      Section = &*Original;
+      Offset = Address - Section->getAddress();
+      const StringRef OriginalContent = Section->getContents();
+      Content = {OriginalContent.data(), OriginalContent.size()};
+    }
+  }
+
+  MCInst Inst;
+  uint64_t Size = 0;
+  if (isAligned(Align(4), Address) && Offset <= Content.size() &&
+      Content.size() - Offset >= 4 &&
+      BC.DisAsm->getInstruction(
+          Inst, Size,
+          ArrayRef(reinterpret_cast<const uint8_t *>(Content.data() + Offset),
+                   4),
+          Address, nulls())) {
+    // BR x16 accepts BTI c, j and jc, including implicit BTI c in PACIASP
+    // and PACIBSP. Keep existing landing pads and authentication intact.
+    if (BC.MIB->isBTILandingPad(Inst, BTIKind::C) ||
+        BC.MIB->isBTILandingPad(Inst, BTIKind::J) ||
+        BC.MIB->isBTILandingPad(Inst, BTIKind::JC))
+      return Error::success();
+    if (BC.MIB->isNoop(Inst)) {
+      SmallVector<char, 4> BTI(4);
+      support::endian::write32le(BTI.data(), 0xd503245f); // BTI c
+      if (Block)
+        llvm::copy(BTI, Block->getAlreadyMutableContent().begin() + Offset);
+      else
+        Section->addPatch(Offset, BTI);
+      return Error::success();
+    }
+  }
+  return make_error<jitlink::JITLinkError>(
+      "Cannot materialize AArch64 branch stub for target 0x" +
+      Twine::utohexstr(Address) +
+      ": target has no compatible BTI landing pad or NOP to patch");
 }
 
 /// Return true for a short (ADRP) stub and false for a long (MOV) stub.
@@ -457,6 +522,18 @@ DeferredStubLinker::reserveStubs(jitlink::LinkGraph &G,
 Error DeferredStubLinker::materialize(jitlink::LinkGraph &G) {
   uint64_t NumShortStubs = 0, NumLongStubs = 0, NumSharedStubs = 0;
 
+  SmallVector<jitlink::Block *> CodeBlocks;
+  if (BC.usesBTI()) {
+    for (auto &Section : G.sections())
+      if ((Section.getMemProt() & orc::MemProt::Exec) != orc::MemProt::None)
+        for (auto *Block : Section.blocks())
+          if (Block->getSize())
+            CodeBlocks.push_back(Block);
+    llvm::sort(CodeBlocks, [](auto *L, auto *R) {
+      return L->getAddress() < R->getAddress();
+    });
+  }
+
   DenseMap<uint64_t, SmallVector<jitlink::Symbol *, 1>> MaterializedStubs;
   for (auto &Record : Stubs) {
     for (const auto &Branch : Record.Branches) {
@@ -489,6 +566,11 @@ Error DeferredStubLinker::materialize(jitlink::LinkGraph &G) {
         if (!isInt<28>(SlotDisplacement))
           return make_error<jitlink::JITLinkError>(
               "Reserved AArch64 branch stub is out of Branch26 range");
+
+        if (BC.usesBTI() && TargetStubs.empty())
+          if (Error Err = ensureAArch64BTITarget(BC, CodeBlocks,
+                                                 TargetAddress.getValue()))
+            return Err;
 
         auto IsShort =
             materializeAArch64Stub(*Record.SlotSym, Edge.getTarget(),

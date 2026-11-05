@@ -39,6 +39,9 @@ bool usesDeferredStubs(const BinaryContext &BC);
 bool fragmentMayFallThrough(const FunctionFragment &Fragment,
                             const BinaryContext &BC);
 
+/// Prepare known indirect destinations before local branch relaxation.
+void prepareDeferredBTITargets(BinaryContext &BC);
+
 } // namespace bolt
 } // namespace llvm
 
