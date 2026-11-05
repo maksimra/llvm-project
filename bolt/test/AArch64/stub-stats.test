@@ -1,0 +1,21 @@
+## Stub statistics are opt-in for the existing AArch64 relaxation modes.
+# REQUIRES: system-linux
+# RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux \
+# RUN:   %p/Inputs/jitlink-fragment-fallthrough.s -o %t.o
+# RUN: ld.lld --emit-relocs -e _start %t.o -o %t.exe
+
+## The other modes create no stubs for this small input.
+# RUN: llvm-bolt %t.exe -o %t.classic --lite=0 --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=CLASSIC
+# CLASSIC: BOLT-INFO: LongJmp stubs: total=0 direct-b=0 short-adrp=0 long-mov=0
+# RUN: llvm-bolt %t.exe -o %t.exp --lite=0 --relax-exp --print-stub-stats \
+# RUN:   | FileCheck %s --check-prefix=EXP
+# EXP: BOLT-INFO: relax-exp stubs: total=0 direct-b=0 short-adrp=0 long-mov=0
+
+# RUN: llvm-bolt %t.exe -o %t.classic.quiet --lite=0 \
+# RUN:   | FileCheck %s --check-prefix=QUIET
+# RUN: llvm-bolt %t.exe -o %t.exp.quiet --lite=0 --relax-exp \
+# RUN:   | FileCheck %s --check-prefix=QUIET
+# QUIET-NOT: stubs:
+# QUIET: BOLT-INFO:
+# QUIET-NOT: stubs:

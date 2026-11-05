@@ -114,6 +114,11 @@ cl::opt<bool> VerifyBranch26Range(
     cl::desc("verify AArch64 Branch26 ranges before JITLink fixups"),
     cl::init(false), cl::Hidden, cl::cat(BoltCategory));
 
+cl::opt<bool> PrintStubStats(
+    "print-stub-stats",
+    cl::desc("print AArch64 stub statistics (short=ADRP, long=MOV)"),
+    cl::cat(BoltCategory));
+
 cl::opt<bool>
 DiffOnly("diff-only",
   cl::desc("stop processing once we have enough to compare two binaries"),
