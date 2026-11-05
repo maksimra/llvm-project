@@ -38,7 +38,8 @@ Error markSectionsLive(jitlink::LinkGraph &G) {
       continue;
 
     // Skip empty sections.
-    if (JITLinkLinker::sectionSize(Section) == 0)
+    if (llvm::none_of(Section.blocks(),
+                      [](const auto *Block) { return Block->getSize() != 0; }))
       continue;
 
     for (auto *Block : Section.blocks()) {
@@ -59,16 +60,8 @@ void reassignSectionAddress(jitlink::LinkGraph &LG,
   auto *JLSection = LG.findSectionByName(BinSection.getSectionID());
   assert(JLSection && "cannot find section in LinkGraph");
 
-  auto BlockAddress = Address;
-  for (auto *Block : JITLinkLinker::orderedBlocks(*JLSection)) {
-    // FIXME it would seem to make sense to align here. However, in
-    // non-relocation mode, we simply use the original address of functions
-    // which might not be aligned with the minimum alignment used by
-    // BinaryFunction (2). Example failing test when aligning:
-    // bolt/test/X86/addr32.s
-    Block->setAddress(orc::ExecutorAddr(BlockAddress));
-    BlockAddress += Block->getSize();
-  }
+  JITLinkLinker::assignBlockAddresses(
+      *JLSection, BinSection.getOutputContents().data(), Address);
 }
 
 } // anonymous namespace
@@ -96,6 +89,13 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   Error modifyPassConfig(jitlink::LinkGraph &G,
                          jitlink::PassConfiguration &Config) override {
     Config.PrePrunePasses.push_back(markSectionsLive);
+
+    Config.PostPrunePasses.push_back([](jitlink::LinkGraph &G) {
+      for (auto &Section : G.sections())
+        layoutBlocks(orderedBlocks(Section));
+      return Error::success();
+    });
+
     Config.PostAllocationPasses.push_back([this](auto &G) {
       MapSections([&G](const BinarySection &Section, uint64_t Address) {
         reassignSectionAddress(G, Section, Address);
@@ -226,15 +226,29 @@ JITLinkLinker::orderedBlocks(const jitlink::Section &Section) {
   return Blocks;
 }
 
-size_t JITLinkLinker::sectionSize(const jitlink::Section &Section) {
-  size_t Size = 0;
-
-  for (const auto *Block : orderedBlocks(Section)) {
-    Size = jitlink::alignToBlock(Size, *Block);
-    Size += Block->getSize();
+uint64_t JITLinkLinker::layoutBlocks(ArrayRef<jitlink::Block *> Blocks,
+                                     uint64_t Offset) {
+  for (auto *Block : Blocks) {
+    Offset = jitlink::alignToBlock(Offset, *Block);
+    Block->setAddress(orc::ExecutorAddr(Offset));
+    Offset += Block->getSize();
   }
+  return Offset;
+}
 
+size_t
+JITLinkLinker::getSectionAllocationSize(const jitlink::Section &Section) {
+  uint64_t Size = 0;
+  for (const auto *Block : Section.blocks())
+    Size = std::max(Size, Block->getAddress().getValue() + Block->getSize());
   return Size;
+}
+
+void JITLinkLinker::assignBlockAddresses(jitlink::Section &Section,
+                                         const char *Buffer, uint64_t Address) {
+  for (auto *Block : Section.blocks())
+    Block->setAddress(
+        orc::ExecutorAddr(Address + (Block->getContent().data() - Buffer)));
 }
 
 } // namespace bolt

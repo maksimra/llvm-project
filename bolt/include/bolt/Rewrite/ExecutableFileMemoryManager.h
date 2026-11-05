@@ -44,6 +44,9 @@ public:
 
   ExecutableFileMemoryManager(BinaryContext &BC) : BC(BC) {}
 
+  /// Copy blocks using their already assigned section-relative addresses.
+  static void copySectionContents(jitlink::Section &Section, char *Buffer);
+
   void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
                 OnAllocatedFunction OnAllocated) override;
 

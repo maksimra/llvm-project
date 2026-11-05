@@ -15,6 +15,7 @@
 
 #include "bolt/Core/Linker.h"
 #include "bolt/Rewrite/ExecutableFileMemoryManager.h"
+#include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/JITLink/JITLinkDylib.h"
 
 #include <memory>
@@ -46,7 +47,15 @@ public:
 
   static SmallVector<jitlink::Block *, 2>
   orderedBlocks(const jitlink::Section &Section);
-  static size_t sectionSize(const jitlink::Section &Section);
+  /// Assign section-relative block addresses once, before allocation.
+  static uint64_t layoutBlocks(ArrayRef<jitlink::Block *> Blocks,
+                               uint64_t Offset = 0);
+  /// Required allocation size from placed blocks' section-relative addresses.
+  /// Call after layout and before rebasing to virtual addresses.
+  static size_t getSectionAllocationSize(const jitlink::Section &Section);
+  /// Rebase from the blocks' actual positions in the allocated section buffer.
+  static void assignBlockAddresses(jitlink::Section &Section,
+                                   const char *Buffer, uint64_t Address);
 };
 
 } // namespace bolt
