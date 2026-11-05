@@ -32,6 +32,9 @@ struct EmittedFragmentSection {
   uint64_t EntryOffset{0};
 };
 
+/// Whether to emit independently placed fragments and defer global relaxation.
+bool usesDeferredStubs(const BinaryContext &BC);
+
 /// Whether fragment emission must append a guard before inserting islands.
 bool fragmentMayFallThrough(const FunctionFragment &Fragment,
                             const BinaryContext &BC);

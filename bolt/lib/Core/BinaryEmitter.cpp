@@ -184,6 +184,13 @@ private:
 } // anonymous namespace
 
 void BinaryEmitter::emitAll(StringRef OrgSecPrefix) {
+  if (usesDeferredStubs(BC) && !BC.HasRelocations) {
+    BC.Ctx->reportError(SMLoc(),
+                        "--turn-off-stubs requires relocation mode for "
+                        "independently placed AArch64 fragments");
+    return;
+  }
+
   Streamer.initSections(*BC.STI);
   Streamer.setUseAssemblerInfoForParsing(false);
 
@@ -276,10 +283,20 @@ void BinaryEmitter::emitFunctions() {
 
   // Mark the end of hot text.
   if (opts::HotText) {
-    if (BC.HasWarmSection)
-      Streamer.switchSection(BC.getCodeSection(BC.getWarmCodeSectionName()));
-    else
-      Streamer.switchSection(BC.getTextSection());
+    MCSection *EndSection = BC.HasWarmSection
+                                ? BC.getCodeSection(BC.getWarmCodeSectionName())
+                                : BC.getTextSection();
+    if (usesDeferredStubs(BC)) {
+      for (const auto &Fragment : llvm::reverse(BC.EmittedFragmentSections)) {
+        if (Fragment.OutputSection == EndSection->getName()) {
+          EndSection = BC.getCodeSection(Fragment.Name);
+          break;
+        }
+      }
+      // If no fragment was emitted into this logical section (e.g. an empty
+      // warm section), keep the marker in the logical section itself.
+    }
+    Streamer.switchSection(EndSection);
     Streamer.emitLabel(BC.getHotTextEndSymbol());
   }
 }
@@ -299,6 +316,29 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 
   MCSection *Section =
       BC.getCodeSection(Function.getCodeSectionName(FF.getFragmentNum()));
+  const bool FragmentSections = usesDeferredStubs(BC);
+  const uint16_t MaxAlignBytes = FF.isSplitFragment()
+                                     ? Function.getMaxColdAlignmentBytes()
+                                     : Function.getMaxAlignmentBytes();
+  const size_t PrefixSize = opts::padFunctionBefore(Function);
+  const bool HasFallThrough =
+      FragmentSections && fragmentMayFallThrough(FF, BC);
+  if (FragmentSections) {
+    // Keep the logical section base aligned, but do not turn a preferred
+    // function alignment into a mandatory alignment of every fragment. MC
+    // records the requirements of the fragment's body (e.g. constant islands)
+    // on its private section. JITLink applies the bounded entry alignment.
+    Section->ensureMinAlignment(Align(BC.AlignFunctions));
+    if (MaxAlignBytes > 0)
+      Section->ensureMinAlignment(Function.getAlign());
+    std::string Name =
+        (Twine(".bolt.fragment.") + Twine(BC.EmittedFragmentSections.size()))
+            .str();
+    BC.EmittedFragmentSections.push_back(
+        {Name, Section->getName().str(), Section->getAlign().value(),
+         HasFallThrough, Function.getAlignment(), MaxAlignBytes, PrefixSize});
+    Section = BC.getCodeSection(Name);
+  }
   Streamer.switchSection(Section);
   Section->setHasInstructions(true);
   BC.Ctx->addGenDwarfSection(Section);
@@ -307,19 +347,17 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
     // Set section alignment to at least maximum possible object alignment.
     // We need this to support LongJmp and other passes that calculates
     // tentative layout.
-    Section->ensureMinAlignment(Align(BC.AlignFunctions));
+    if (!FragmentSections)
+      Section->ensureMinAlignment(Align(BC.AlignFunctions));
 
     Streamer.emitCodeAlignment(Function.getMinAlign(), *BC.STI);
-    uint16_t MaxAlignBytes = FF.isSplitFragment()
-                                 ? Function.getMaxColdAlignmentBytes()
-                                 : Function.getMaxAlignmentBytes();
-    if (MaxAlignBytes > 0)
+    if (!FragmentSections && MaxAlignBytes > 0)
       Streamer.emitCodeAlignment(Function.getAlign(), *BC.STI, MaxAlignBytes);
   } else {
     Streamer.emitCodeAlignment(Function.getAlign(), *BC.STI);
   }
 
-  if (size_t Padding = opts::padFunctionBefore(Function)) {
+  if (size_t Padding = PrefixSize) {
     // Handle padFuncsBefore after the above alignment logic but before
     // symbol addresses are decided.
     if (!BC.HasRelocations) {
@@ -409,11 +447,19 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   if (opts::MarkFuncs)
     Streamer.emitBytes(BC.MIB->getTrapFillValue());
 
+  MCSymbol *EndSymbol = Function.getFunctionEndLabel(FF.getFragmentNum());
+  if (HasFallThrough) {
+    MCInst Branch;
+    // Create branch with temporary target.
+    // JITLink will retarget it past the reserved stub space.
+    BC.MIB->createUncondBranch(Branch, EndSymbol, BC.Ctx.get());
+    Streamer.emitInstruction(Branch, *BC.STI);
+  }
+
   // Emit CFI end
   if (NeedsFDE)
     Streamer.emitCFIEndProc();
 
-  MCSymbol *EndSymbol = Function.getFunctionEndLabel(FF.getFragmentNum());
   Streamer.emitLabel(EndSymbol);
 
   if (MAI.hasDotTypeDotSizeDirective()) {

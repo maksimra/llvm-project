@@ -10,6 +10,7 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
+#include "bolt/Rewrite/DeferredStubLinker.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
@@ -92,6 +93,8 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   JITLinkLinker &Linker;
   JITLinkLinker::SectionsMapper MapSections;
 
+  std::unique_ptr<DeferredStubLinker> StubLinker;
+
   Context(JITLinkLinker &Linker, JITLinkLinker::SectionsMapper MapSections)
       : JITLinkContext(&Linker.Dylib), Linker(Linker),
         MapSections(MapSections) {}
@@ -112,11 +115,18 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                          jitlink::PassConfiguration &Config) override {
     Config.PrePrunePasses.push_back(markSectionsLive);
 
-    Config.PostPrunePasses.push_back([](jitlink::LinkGraph &G) {
-      for (auto &Section : G.sections())
-        layoutBlocks(orderedBlocks(Section));
-      return Error::success();
-    });
+    // Only the main ELF object has BOLT's fragment sections and fall-through
+    // guards. Runtime objects must retain their original block layout.
+    if (usesDeferredStubs(Linker.BC) && !Linker.MM->ObjectsLoaded) {
+      StubLinker = std::make_unique<DeferredStubLinker>(Linker.BC);
+      StubLinker->addPasses(Config);
+    } else {
+      Config.PostPrunePasses.push_back([](jitlink::LinkGraph &G) {
+        for (auto &Section : G.sections())
+          layoutBlocks(orderedBlocks(Section));
+        return Error::success();
+      });
+    }
 
     Config.PostAllocationPasses.push_back([this](auto &G) {
       MapSections([&G](const BinarySection &Section, uint64_t Address) {
@@ -130,8 +140,9 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
           jitlink::createRelaxationPass_ELF_riscv());
     }
 
-    if (opts::VerifyBranch26Range && G.getTargetTriple().isAArch64())
+    if (opts::VerifyBranch26Range && G.getTargetTriple().isAArch64()) {
       Config.PreFixupPasses.push_back(verifyAArch64Branch26Range);
+    }
 
     return Error::success();
   }

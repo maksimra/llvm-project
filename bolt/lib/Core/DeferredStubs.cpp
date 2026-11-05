@@ -9,9 +9,14 @@
 #include "bolt/Core/DeferredStubs.h"
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryFunction.h"
+#include "bolt/Utils/CommandLineOpts.h"
 
 namespace llvm {
 namespace bolt {
+
+bool usesDeferredStubs(const BinaryContext &BC) {
+  return opts::DeferredStubs && BC.isELF() && BC.isAArch64();
+}
 
 bool fragmentMayFallThrough(const FunctionFragment &Fragment,
                             const BinaryContext &BC) {
