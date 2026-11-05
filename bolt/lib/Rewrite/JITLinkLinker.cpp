@@ -10,11 +10,14 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/aarch64.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "bolt"
 
@@ -64,6 +67,25 @@ void reassignSectionAddress(jitlink::LinkGraph &LG,
       *JLSection, BinSection.getOutputContents().data(), Address);
 }
 
+/// Check final branch destinations after mapping and any stub materialization.
+Error verifyAArch64Branch26Range(jitlink::LinkGraph &G) {
+  for (auto *Block : G.blocks()) {
+    for (const jitlink::Edge &Edge : Block->edges()) {
+      if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
+        continue;
+      const auto Source = Block->getFixupAddress(Edge);
+      const auto Target = Edge.getTarget().getAddress() + Edge.getAddend();
+      if (!isInt<28>(Target - Source))
+        return make_error<jitlink::JITLinkError>(
+            "AArch64 Branch26 target out of range before fixups: branch at 0x" +
+            Twine::utohexstr(Source.getValue()) + " in " +
+            Block->getSection().getName() + " targets 0x" +
+            Twine::utohexstr(Target.getValue()));
+    }
+  }
+  return Error::success();
+}
+
 } // anonymous namespace
 
 struct JITLinkLinker::Context : jitlink::JITLinkContext {
@@ -107,6 +129,9 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
       Config.PostAllocationPasses.push_back(
           jitlink::createRelaxationPass_ELF_riscv());
     }
+
+    if (opts::VerifyBranch26Range && G.getTargetTriple().isAArch64())
+      Config.PreFixupPasses.push_back(verifyAArch64Branch26Range);
 
     return Error::success();
   }

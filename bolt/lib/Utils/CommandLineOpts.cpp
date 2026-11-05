@@ -109,6 +109,11 @@ cl::opt<bool>
                      cl::desc("generate code for binaries <128MB on AArch64"),
                      cl::init(false), cl::cat(BoltCategory));
 
+cl::opt<bool> VerifyBranch26Range(
+    "verify-branch26-range",
+    cl::desc("verify AArch64 Branch26 ranges before JITLink fixups"),
+    cl::init(false), cl::Hidden, cl::cat(BoltCategory));
+
 cl::opt<bool>
 DiffOnly("diff-only",
   cl::desc("stop processing once we have enough to compare two binaries"),
