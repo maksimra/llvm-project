@@ -56,6 +56,15 @@ materialized stub by numeric target address, including across output sections.
 Otherwise it fills the reserved slot with ADRP/ADD/BR or MOV/BR. Unused slots
 remain NOPs. This phase changes neither block sizes nor placement.
 
+For BTI binaries, `LongJmpPass` prepares known emitted branch destinations and
+fragment entries with landing pads before local relaxation. Existing BTI c/j/jc
+and implicit PACIASP/PACIBSP landing pads are retained. When a stub is actually
+needed, JITLink checks its exact destination, including any addend. It can replace
+an existing NOP with BTI c without changing the layout, including in original
+code left in place. A destination without a compatible pad or a patchable NOP is
+diagnosed instead of emitting an invalid indirect branch. Direct branches need
+no landing pad.
+
 ## Why this does not duplicate LongJmpPass layout
 
 There is one owner of each decision:
