@@ -17,6 +17,7 @@
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
 #include "bolt/Core/DebugData.h"
+#include "bolt/Core/DeferredStubs.h"
 #include "bolt/Core/DynoStats.h"
 #include "bolt/Core/JumpTable.h"
 #include "bolt/Core/MCPlusBuilder.h"
@@ -314,6 +315,9 @@ public:
   /// multiple compilation units, instructions may reference debug line
   /// information from multiple CUs.
   ClusteredRowsContainer ClusteredRows;
+
+  /// Private code sections, in emission order, for deferred AArch64 stubs.
+  std::vector<EmittedFragmentSection> EmittedFragmentSections;
 
   // Setup MCPlus target builder
   void initializeTarget(std::unique_ptr<MCPlusBuilder> TargetBuilder) {

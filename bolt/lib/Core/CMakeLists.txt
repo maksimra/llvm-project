@@ -26,6 +26,7 @@ add_llvm_library(LLVMBOLTCore
   CallGraphWalker.cpp
   DebugData.cpp
   DebugNames.cpp
+  DeferredStubs.cpp
   DIEBuilder.cpp
   DynoStats.cpp
   Exceptions.cpp

@@ -16,6 +16,7 @@ add_llvm_library(LLVMBOLTRewrite
   BinaryPassManager.cpp
   BoltDiff.cpp
   DWARFRewriter.cpp
+  DeferredStubLinker.cpp
   ExecutableFileMemoryManager.cpp
   JITLinkLinker.cpp
   LinuxKernelRewriter.cpp
