@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Rewrite/BinaryPassManager.h"
+#include "bolt/Core/DeferredStubs.h"
 #include "bolt/Passes/AArch64RelaxationPass.h"
 #include "bolt/Passes/Aligner.h"
 #include "bolt/Passes/AllocCombiner.h"
@@ -28,6 +29,7 @@
 #include "bolt/Passes/PatchEntries.h"
 #include "bolt/Passes/PointerAuthCFIAnalyzer.h"
 #include "bolt/Passes/PointerAuthCFIFixup.h"
+#include "bolt/Passes/PrepareDeferredBTI.h"
 #include "bolt/Passes/ProfileQualityStats.h"
 #include "bolt/Passes/RegReAssign.h"
 #include "bolt/Passes/ReorderData.h"
@@ -542,10 +544,10 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
     Manager.registerPass(
         std::make_unique<AArch64RelaxationPass>(PrintAArch64Relaxation));
 
-    // Tighten branches according to offset differences between branch and
-    // targets. No extra instructions after this pass, otherwise we may have
-    // relocations out of range and crash during linking.
-    Manager.registerPass(std::make_unique<LongJmpPass>(PrintLongJmp));
+    if (!usesDeferredStubs(BC))
+      Manager.registerPass(std::make_unique<LongJmpPass>(PrintLongJmp));
+    else if (BC.usesBTI())
+      Manager.registerPass(std::make_unique<PrepareDeferredBTI>());
 
     Manager.registerPass(
         std::make_unique<PointerAuthCFIFixup>(PrintPAuthCFIFixup));

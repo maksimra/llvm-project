@@ -244,6 +244,184 @@ Error mergeFragmentSection(jitlink::LinkGraph &G,
 
 } // namespace
 
+Expected<std::vector<DeferredStubLinker::LocalBranch>>
+DeferredStubLinker::importBranches(jitlink::LinkGraph &G) {
+  std::vector<LocalBranch> Branches;
+  auto *Info = G.findSectionByName(DeferredBranchSectionName);
+  if (!Info)
+    return Branches;
+
+  for (auto *Block : Info->blocks()) {
+    if (Block->isZeroFill() || Block->getSize() % DeferredBranchRecordSize)
+      return make_error<jitlink::JITLinkError>(
+          "Invalid deferred branch records");
+    const auto Content = Block->getContent();
+    DenseMap<jitlink::Edge::OffsetT, const jitlink::Edge *> FieldsByOffset;
+    for (const auto &Edge : Block->edges()) {
+      const unsigned Field = Edge.getOffset() % DeferredBranchRecordSize;
+      if (Edge.getKind() != jitlink::aarch64::Pointer64 ||
+          Edge.getOffset() >= Content.size() ||
+          (Field != offsetof(DeferredBranchRecord, Source) &&
+           Field != offsetof(DeferredBranchRecord, Target) &&
+           Field != offsetof(DeferredBranchRecord, LongBranch)) ||
+          !FieldsByOffset.try_emplace(Edge.getOffset(), &Edge).second)
+        return make_error<jitlink::JITLinkError>(
+            "Invalid deferred branch relocation");
+    }
+    for (uint64_t Offset = 0; Offset < Content.size();
+         Offset += DeferredBranchRecordSize) {
+      const jitlink::Edge *Fields[] = {
+          FieldsByOffset.lookup(Offset +
+                                offsetof(DeferredBranchRecord, Source)),
+          FieldsByOffset.lookup(Offset +
+                                offsetof(DeferredBranchRecord, Target)),
+          FieldsByOffset.lookup(Offset +
+                                offsetof(DeferredBranchRecord, LongBranch))};
+      if (!Fields[0] || !Fields[1])
+        return make_error<jitlink::JITLinkError>(
+            "Missing deferred branch relocation");
+
+      // Pointer relocations may use section symbols plus addends. Normalize
+      // source/fallback anchors before private fragment sections are merged.
+      auto Anchor = [](const jitlink::Edge &Edge)
+          -> Expected<std::pair<jitlink::Block *, jitlink::Edge::OffsetT>> {
+        if (!Edge.getTarget().isDefined())
+          return make_error<jitlink::JITLinkError>(
+              "Undefined deferred branch anchor");
+        auto &Target = Edge.getTarget();
+        auto &B = Target.getBlock();
+        const uint64_t Offset = Target.getOffset() + Edge.getAddend();
+        if (Offset > B.getSize() || B.getSize() - Offset < 4 || Offset % 4 ||
+            Offset > std::numeric_limits<jitlink::Edge::OffsetT>::max())
+          return make_error<jitlink::JITLinkError>(
+              "Invalid deferred branch anchor offset");
+        return std::make_pair(&B, jitlink::Edge::OffsetT(Offset));
+      };
+      auto Source = Anchor(*Fields[0]);
+      if (!Source)
+        return Source.takeError();
+      std::pair<jitlink::Block *, jitlink::Edge::OffsetT> Fallback{nullptr, 0};
+      if (Fields[2]) {
+        auto Parsed = Anchor(*Fields[2]);
+        if (!Parsed)
+          return Parsed.takeError();
+        Fallback = *Parsed;
+      }
+
+      const char *Data = Content.data() + Offset;
+      const uint32_t Encoding = support::endian::read32le(
+          Data + offsetof(DeferredBranchRecord, Encoding));
+      const uint8_t Bits =
+          Data[offsetof(DeferredBranchRecord, DisplacementBits)];
+      const uint8_t Size = Data[offsetof(DeferredBranchRecord, ReservedSize)];
+      if ((Bits != 11 && Bits != 16 && Bits != 21 && Bits != 28) ||
+          (Size != 4 && Size != 8 && Size != 12) ||
+          Size > Source->first->getSize() - Source->second ||
+          support::endian::read16le(Data +
+                                    offsetof(DeferredBranchRecord, Padding)) ||
+          (Size != 4 && (Fallback.first != Source->first ||
+                         Fallback.second != Source->second + Size - 4)) ||
+          (Bits == 28 && (Size != 4 || Fallback != *Source)))
+        return make_error<jitlink::JITLinkError>(
+            "Invalid deferred branch instruction record");
+      auto &Target = Fields[1]->getTarget();
+      const auto Addend = Fields[1]->getAddend();
+      if (Target.isDefined()) {
+        jitlink::Edge Check(jitlink::aarch64::Branch26PCRel, Source->second,
+                            Target, Addend);
+        if (Error Err = validateFragmentEdge(*Source->first, Check))
+          return std::move(Err);
+      }
+      if (Fallback.first) {
+        // Every potential long leg must be visible to reserveStubs, even if
+        // the final conditional branch will turn out to fit directly.
+        support::endian::write32le(Fallback.first->getMutableContent(G).data() +
+                                       Fallback.second,
+                                   Bits == 28 ? Encoding : 0x14000000);
+        Fallback.first->addEdge(jitlink::aarch64::Branch26PCRel,
+                                Fallback.second, Target, Addend);
+      } else {
+        Source->first->addEdge(jitlink::Edge::KeepAlive, Source->second, Target,
+                               Addend);
+      }
+      if (Bits != 28)
+        Branches.push_back({Source->first, Source->second, &Target, Addend,
+                            Fallback.first, Fallback.second, Encoding, Bits,
+                            Size});
+    }
+  }
+
+  SmallVector<jitlink::Symbol *> Symbols(Info->symbols());
+  for (auto *Symbol : Symbols)
+    G.removeDefinedSymbol(*Symbol);
+  SmallVector<jitlink::Block *> Blocks(Info->blocks());
+  for (auto *Block : Blocks)
+    G.removeBlock(*Block);
+  G.removeSection(*Info);
+  return Branches;
+}
+
+Error DeferredStubLinker::relaxBranches(jitlink::LinkGraph &G,
+                                        ArrayRef<LocalBranch> Branches) {
+  DenseSet<jitlink::Block *> IndexedBlocks;
+  DenseMap<std::pair<jitlink::Block *, jitlink::Edge::OffsetT>, jitlink::Edge *>
+      LongLegs;
+  for (const auto &Branch : Branches) {
+    auto *Block = Branch.FallbackBlock;
+    if (!Block || !IndexedBlocks.insert(Block).second)
+      continue;
+    for (auto &Edge : Block->edges())
+      if (Edge.getKind() == jitlink::aarch64::Branch26PCRel)
+        LongLegs[{Block, Edge.getOffset()}] = &Edge;
+  }
+  for (const auto &Branch : Branches) {
+    const auto Source = Branch.SourceBlock->getAddress() + Branch.SourceOffset;
+    const auto Target = Branch.Target->getAddress() + Branch.Addend;
+    const int64_t Delta = Target - Source;
+    if (Delta & 3)
+      return make_error<jitlink::JITLinkError>(
+          "Unaligned deferred AArch64 branch target");
+    const bool Direct = isIntN(Branch.Bits, Delta);
+    auto Content = Branch.SourceBlock->getMutableContent(G);
+    if (Direct || Branch.Size == 4) {
+      int64_t Displacement = Delta;
+      if (!Direct) {
+        if (!Branch.FallbackBlock)
+          return make_error<jitlink::JITLinkError>(
+              "Cannot expand conditional branch in a fixed-size patch");
+        Displacement =
+            (Branch.FallbackBlock->getAddress() + Branch.FallbackOffset) -
+            Source;
+        if (!isIntN(Branch.Bits, Displacement) || (Displacement & 3))
+          return make_error<jitlink::JITLinkError>(
+              "Deferred AArch64 branch cannot reach its tail trampoline");
+      }
+      // All supported short branches encode imm[Bits-3:0] starting at bit 5.
+      const uint32_t Mask = ((1u << (Branch.Bits - 2)) - 1) << 5;
+      const uint32_t Imm = (uint32_t(Displacement >> 2) << 5) & Mask;
+      support::endian::write32le(Content.data() + Branch.SourceOffset,
+                                 (Branch.Encoding & ~Mask) | Imm);
+    }
+    if (!Direct)
+      continue;
+    for (unsigned I = 4; I < Branch.Size; I += 4)
+      support::endian::write32le(Content.data() + Branch.SourceOffset + I,
+                                 0xd503201f);
+    if (Branch.FallbackBlock) {
+      auto &Fallback = *Branch.FallbackBlock;
+      support::endian::write32le(Fallback.getMutableContent(G).data() +
+                                     Branch.FallbackOffset,
+                                 0xd503201f);
+      auto *LongLeg = LongLegs.lookup({&Fallback, Branch.FallbackOffset});
+      assert(LongLeg && "Missing deferred long branch");
+      // Disable its fixup without invalidating the edge index. This also
+      // avoids quadratic erasure in fragments with many short branches.
+      LongLeg->setKind(jitlink::Edge::KeepAlive);
+    }
+  }
+  return Error::success();
+}
+
 Error DeferredStubLinker::mergeFragmentSections(
     jitlink::LinkGraph &G, ArrayRef<EmittedFragmentSection> Fragments,
     FragmentMap &FragmentsByBlock) {
@@ -599,6 +777,13 @@ Error DeferredStubLinker::materialize(jitlink::LinkGraph &G) {
 }
 
 void DeferredStubLinker::addPasses(jitlink::PassConfiguration &Config) {
+  Config.PrePrunePasses.push_back([this](jitlink::LinkGraph &G) -> Error {
+    auto Imported = importBranches(G);
+    if (!Imported)
+      return Imported.takeError();
+    Branches = std::move(*Imported);
+    return Error::success();
+  });
   Config.PostPrunePasses.push_back([this](jitlink::LinkGraph &G) -> Error {
     FragmentMap FragmentsByBlock;
     if (Error Err = mergeFragmentSections(G, BC.EmittedFragmentSections,
@@ -616,8 +801,11 @@ void DeferredStubLinker::addPasses(jitlink::PassConfiguration &Config) {
         JITLinkLinker::layoutBlocks(JITLinkLinker::orderedBlocks(Section));
     return Error::success();
   });
-  Config.PreFixupPasses.push_back(
-      [this](jitlink::LinkGraph &G) { return materialize(G); });
+  Config.PreFixupPasses.push_back([this](jitlink::LinkGraph &G) -> Error {
+    if (Error Err = relaxBranches(G, Branches))
+      return Err;
+    return materialize(G);
+  });
 }
 
 } // namespace bolt

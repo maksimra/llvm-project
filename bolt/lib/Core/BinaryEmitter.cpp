@@ -15,6 +15,7 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Core/DebugData.h"
+#include "bolt/Core/DeferredStubs.h"
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
@@ -24,6 +25,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/SMLoc.h"
+#include <optional>
 
 #define DEBUG_TYPE "bolt"
 
@@ -34,13 +36,10 @@ namespace opts {
 
 extern cl::opt<JumpTableSupportLevel> JumpTables;
 
-static cl::list<std::string>
-BreakFunctionNames("break-funcs",
-  cl::CommaSeparated,
-  cl::desc("list of functions to core dump on (debugging)"),
-  cl::value_desc("func1,func2,func3,..."),
-  cl::Hidden,
-  cl::cat(BoltCategory));
+static cl::list<std::string> BreakFunctionNames(
+    "break-funcs", cl::CommaSeparated,
+    cl::desc("list of functions to core dump on (debugging)"),
+    cl::value_desc("func1,func2,func3,..."), cl::Hidden, cl::cat(BoltCategory));
 
 static cl::list<std::string>
     FunctionPadSpec("pad-funcs", cl::CommaSeparated,
@@ -102,6 +101,13 @@ size_t padFunctionAfter(const BinaryFunction &Function) {
 namespace {
 using JumpTable = bolt::JumpTable;
 
+struct TailTrampoline {
+  MCSymbol *Label;
+  /// Index in the CFI suffix following the first trampoline's source.
+  size_t CFIState;
+  int64_t GnuArgsSize;
+};
+
 class BinaryEmitter {
 private:
   BinaryEmitter(const BinaryEmitter &) = delete;
@@ -142,6 +148,10 @@ private:
                      MCSection *ColdSection);
 
   void emitCFIInstruction(const MCCFIInstruction &Inst) const;
+
+  void emitTailTrampolines(ArrayRef<TailTrampoline> Trampolines,
+                           ArrayRef<const MCCFIInstruction *> CFISuffix,
+                           bool EmitCFI, int64_t GnuArgsSize);
 
   /// Emit exception handling ranges for the function fragment.
   void emitLSDA(BinaryFunction &BF, const FunctionFragment &FF);
@@ -492,6 +502,18 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
 
   // Track the first emitted instruction with debug info.
   bool FirstInstr = true;
+  SmallVector<TailTrampoline> TailTrampolines;
+  SmallVector<const MCCFIInstruction *> TrampolineCFI;
+  const BranchExpansion Expansion = BF.isPatch()    ? BranchExpansion::None
+                                    : BF.isSimple() ? BranchExpansion::Inline
+                                                    : BranchExpansion::Tail;
+  const bool EmitTrampolineCFI =
+      !EmitCodeOnly && BF.hasCFI() && Expansion == BranchExpansion::Tail;
+  int64_t GnuArgsSize = 0;
+  if (EmitTrampolineCFI)
+    for (const MCCFIInstruction &CFI : BF.cie())
+      if (CFI.getOperation() == MCCFIInstruction::OpGnuArgsSize)
+        GnuArgsSize = CFI.getOffset();
   for (BinaryBasicBlock *const BB : FF) {
     if ((BC.AlignBlocks || BC.PreserveBlocksAlignment) &&
         BB->getAlignment() > 1)
@@ -512,7 +534,14 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
 
       // Handle pseudo instructions.
       if (BC.MIB->isCFI(Instr)) {
-        emitCFIInstruction(*BF.getCFIFor(Instr));
+        const MCCFIInstruction *CFI = BF.getCFIFor(Instr);
+        emitCFIInstruction(*CFI);
+        if (EmitTrampolineCFI) {
+          if (!TailTrampolines.empty())
+            TrampolineCFI.push_back(CFI);
+          if (CFI->getOperation() == MCCFIInstruction::OpGnuArgsSize)
+            GnuArgsSize = CFI->getOffset();
+        }
         continue;
       }
 
@@ -553,12 +582,69 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         }
       }
 
-      Streamer.emitInstruction(Instr, *BC.STI);
+      const MCInstrDesc &Desc = BC.MII->get(Instr.getOpcode());
+      if (usesDeferredStubs(BC) && (Desc.isBranch() || Desc.isCall()) &&
+          !Desc.isIndirectBranch() && !BC.MIB->isIndirectCall(Instr) &&
+          BC.MIB->getTargetSymbol(Instr)) {
+        if (MCSymbol *Trampoline = emitDeferredBranch(
+                Streamer, BC, Instr, Expansion, /*EmitRecord=*/!EmitCodeOnly)) {
+          // Share a snapshot until the emitted CFI changes. The pool consumes
+          // these snapshots in reverse order, restoring each branch's state.
+          if (EmitTrampolineCFI &&
+              (TailTrampolines.empty() ||
+               TailTrampolines.back().CFIState != TrampolineCFI.size()))
+            Streamer.emitCFIRememberState({});
+          TailTrampolines.push_back(
+              {Trampoline, TrampolineCFI.size(), GnuArgsSize});
+        }
+      } else {
+        Streamer.emitInstruction(Instr, *BC.STI);
+      }
     }
   }
 
   if (!EmitCodeOnly)
     emitConstantIslands(BF, FF.isSplitFragment());
+
+  emitTailTrampolines(TailTrampolines, TrampolineCFI, EmitTrampolineCFI,
+                      GnuArgsSize);
+}
+
+void BinaryEmitter::emitTailTrampolines(
+    ArrayRef<TailTrampoline> Trampolines,
+    ArrayRef<const MCCFIInstruction *> CFISuffix, bool EmitCFI,
+    int64_t GnuArgsSize) {
+  if (Trampolines.empty())
+    return;
+
+  auto EmitJump = [&](MCSymbol *Target) {
+    MCInst Jump;
+    BC.MIB->createUncondBranch(Jump, Target, &Streamer.getContext());
+    Streamer.emitInstruction(Jump, *BC.STI);
+  };
+  MCSymbol *Continuation = Streamer.getContext().createTempSymbol();
+  EmitJump(Continuation);
+  std::optional<size_t> RestoredState;
+  for (const TailTrampoline &Trampoline : llvm::reverse(Trampolines)) {
+    if (EmitCFI) {
+      if (RestoredState != Trampoline.CFIState) {
+        Streamer.emitCFIRestoreState({});
+        RestoredState = Trampoline.CFIState;
+      }
+      // GNU_args_size is not part of the saved register state in all unwinders.
+      if (GnuArgsSize != Trampoline.GnuArgsSize) {
+        Streamer.emitCFIGnuArgsSize(Trampoline.GnuArgsSize);
+        GnuArgsSize = Trampoline.GnuArgsSize;
+      }
+    }
+    Streamer.emitLabel(Trampoline.Label);
+    EmitJump(Trampoline.Label);
+  }
+  Streamer.emitLabel(Continuation);
+  // The last restore leaves the first source's state. Replay the suffix to
+  // recover the body's final state for fall-through, padding and island guards.
+  for (const MCCFIInstruction *CFI : CFISuffix)
+    emitCFIInstruction(*CFI);
 }
 
 void BinaryEmitter::emitConstantIslands(BinaryFunction &BF, bool EmitColdPart,

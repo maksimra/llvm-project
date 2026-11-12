@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Passes/LongJmp.h"
-#include "bolt/Core/DeferredStubs.h"
 #include "bolt/Core/ParallelUtilities.h"
 #include "bolt/Passes/BranchLivenessUtils.h"
 #include "bolt/Passes/RegAnalysis.h"
@@ -1785,9 +1784,6 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
           opts::SplitStrategy != opts::SplitFunctionsStrategy::CDSplit) &&
          "LongJmp cannot work with functions split in more than two fragments");
 
-  if (usesDeferredStubs(BC) && BC.usesBTI())
-    prepareDeferredBTITargets(BC);
-
   DenseMap<BinaryFunction *, BranchLivenessInfo> BranchLiveness;
 
   if (opts::FixBranchesWithLiveness) {
@@ -1809,8 +1805,7 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
     return It == BranchLiveness.end() ? nullptr : &It->second;
   };
 
-  if (opts::CompactCodeModel || opts::ExperimentalRelaxation ||
-      usesDeferredStubs(BC)) {
+  if (opts::CompactCodeModel || opts::ExperimentalRelaxation) {
     BC.outs()
         << "BOLT-INFO: relaxing branches for compact code model (<128MB)\n";
 
@@ -1833,7 +1828,7 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
     if (HasFatal)
       return createFatalBOLTError("branch relaxation failure");
 
-    if (!opts::ExperimentalRelaxation || usesDeferredStubs(BC))
+    if (!opts::ExperimentalRelaxation)
       return Error::success();
 
     BC.outs() << "BOLT-INFO: starting experimental relaxation pass\n";

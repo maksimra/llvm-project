@@ -2194,6 +2194,12 @@ public:
 
   bool isReversibleBranch(const MCInst &Inst,
                           bool MustPreserveFlags = true) const override {
+    if (Inst.getOpcode() == AArch64::Bcc) {
+      const auto Condition =
+          static_cast<AArch64CC::CondCode>(Inst.getOperand(0).getImm());
+      if (Condition == AArch64CC::AL || Condition == AArch64CC::NV)
+        return false;
+    }
     if (isCompAndBranch(Inst)) {
       unsigned InvertedOpcode = getInvertedBranchOpcode(Inst.getOpcode());
       if (needsImmDec(InvertedOpcode) && Inst.getOperand(1).getImm() == 0 &&
@@ -2281,6 +2287,8 @@ public:
     if (isTB(Inst))
       return 16;
     if (isCB(Inst))
+      return 21;
+    if (isADR(Inst) || isLoadLiteralGPR(Inst))
       return 21;
     switch (Inst.getOpcode()) {
     default:

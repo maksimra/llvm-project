@@ -23,10 +23,15 @@
 
 #include "bolt/Core/BinaryBasicBlock.h"
 #include "bolt/Core/BinaryFunction.h"
+#include "bolt/Core/DeferredStubs.h"
 #include "bolt/Rewrite/RewriteInstance.h"
+#include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
+#include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/MC/MCObjectStreamer.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "gtest/gtest.h"
@@ -412,6 +417,72 @@ TEST_P(MCPlusBuilderTester, AArch64_ReverseCompAndBranch_Overflows) {
   ASSERT_EQ(Code[0].getOperand(3).getImm(), 0);
   ASSERT_EQ(Code[1].getOpcode(), AArch64::Bcc);
   ASSERT_EQ(Code[1].getOperand(0).getImm(), AArch64CC::LS);
+}
+
+TEST_P(MCPlusBuilderTester, AArch64_AlwaysBranchesCannotBeInverted) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  for (auto Condition : {AArch64CC::AL, AArch64CC::NV}) {
+    MCInst Branch = MCInstBuilder(AArch64::Bcc).addImm(Condition).addImm(0);
+    EXPECT_FALSE(BC->MIB->isReversibleBranch(Branch));
+  }
+}
+
+TEST_P(MCPlusBuilderTester, AArch64_DeferredMeasurementIncludesBranchReserve) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  SmallString<0> Object;
+  raw_svector_ostream OS(Object);
+  auto Streamer = BC->createStreamer(OS);
+  Streamer->initSections(*BC->STI);
+  MCSymbol *Begin = BC->Ctx->createTempSymbol();
+  MCSymbol *End = BC->Ctx->createTempSymbol();
+  MCInst Branch = MCInstBuilder(AArch64::TBZW)
+                      .addReg(AArch64::W0)
+                      .addImm(0)
+                      .addExpr(MCSymbolRefExpr::create(End, *BC->Ctx));
+  Streamer->emitLabel(Begin);
+  EXPECT_EQ(emitDeferredBranch(*Streamer, *BC, Branch, BranchExpansion::Inline,
+                               /*EmitRecord=*/false),
+            nullptr);
+  Streamer->emitLabel(End);
+  auto &Assembler = static_cast<MCObjectStreamer &>(*Streamer).getAssembler();
+  Assembler.layout();
+  // Measurement must include both the conditional instruction and its B leg.
+  EXPECT_EQ(Assembler.getSymbolOffset(*End) - Assembler.getSymbolOffset(*Begin),
+            2 * BC->MIB->getInstructionSize(Branch).value());
+  for (const MCSection &Section : Assembler)
+    EXPECT_NE(Section.getName(), DeferredBranchSectionName);
+}
+
+TEST_P(MCPlusBuilderTester, AArch64_DeferredSizeUsesIsolatedContext) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const bool SavedDeferredStubs = opts::DeferredStubs;
+  scope_exit RestoreOption(
+      [SavedDeferredStubs] { opts::DeferredStubs = SavedDeferredStubs; });
+  opts::DeferredStubs = true;
+
+  BinaryFunction *BF = BC->createInjectedBinaryFunction("measured", true);
+  BinaryBasicBlock *Entry = BF->addBasicBlock();
+  BinaryBasicBlock *FallThrough = BF->addBasicBlock();
+  BinaryBasicBlock *Taken = BF->addBasicBlock();
+  Entry->addInstruction(
+      MCInstBuilder(AArch64::TBZW)
+          .addReg(AArch64::W0)
+          .addImm(0)
+          .addExpr(MCSymbolRefExpr::create(Taken->getLabel(), *BC->Ctx)));
+  MCInst Nop;
+  BC->MIB->createNoop(Nop);
+  FallThrough->addInstruction(Nop);
+  Taken->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+
+  const auto SymbolCount = BC->Ctx->getSymbols().size();
+  const auto [HotSize, ColdSize] =
+      BC->calculateEmittedSize(*BF, /*FixBranches=*/false);
+  EXPECT_EQ(HotSize, 4 * BC->MIB->getInstructionSize(Nop).value());
+  EXPECT_EQ(ColdSize, 0u);
+  EXPECT_EQ(BC->Ctx->getSymbols().size(), SymbolCount);
 }
 
 TEST_P(MCPlusBuilderTester, AArch64_IsReversibleBranch_LiveCondFlags) {

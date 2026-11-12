@@ -11,6 +11,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/JITLink/aarch64.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/MathExtras.h"
 #include "gtest/gtest.h"
 
@@ -57,6 +58,35 @@ protected:
     B.addEdge(aarch64::Branch26PCRel, Offset, Target, Addend);
   }
 
+  void deferredBranch(Block &Source, uint32_t SourceOffset, Symbol &Target,
+                      uint8_t Bits, uint8_t Size, uint32_t Encoding,
+                      std::optional<uint32_t> FallbackOffset,
+                      int64_t Addend = 0) {
+    auto *Info = G.findSectionByName(DeferredBranchSectionName);
+    if (!Info) {
+      Info = &G.createSection(DeferredBranchSectionName, orc::MemProt::Read);
+      Info->setMemLifetime(orc::MemLifetime::NoAlloc);
+    }
+    auto Bytes = G.allocateBuffer(DeferredBranchRecordSize);
+    llvm::fill(Bytes, 0);
+    support::endian::write32le(
+        Bytes.data() + offsetof(DeferredBranchRecord, Encoding), Encoding);
+    Bytes[offsetof(DeferredBranchRecord, DisplacementBits)] = Bits;
+    Bytes[offsetof(DeferredBranchRecord, ReservedSize)] = Size;
+    auto &Record =
+        G.createMutableContentBlock(*Info, Bytes, orc::ExecutorAddr(), 1, 0);
+    auto &Anchor = G.addAnonymousSymbol(Source, 0, 0, true, true);
+    // Use section-style anchors plus addends, in non-source order.
+    Record.addEdge(aarch64::Pointer64, offsetof(DeferredBranchRecord, Target),
+                   Target, Addend);
+    if (FallbackOffset)
+      Record.addEdge(aarch64::Pointer64,
+                     offsetof(DeferredBranchRecord, LongBranch), Anchor,
+                     *FallbackOffset);
+    Record.addEdge(aarch64::Pointer64, offsetof(DeferredBranchRecord, Source),
+                   Anchor, SourceOffset);
+  }
+
   void checkReachability(ArrayRef<DeferredStubLinker::Stub> Stubs) {
     for (const auto &Stub : Stubs)
       for (const auto &Branch : Stub.Branches)
@@ -65,6 +95,120 @@ protected:
                     (Branch.SourceBlock->getAddress() + Branch.SourceOffset))));
   }
 };
+
+TEST_F(AArch64StubBatchTest, DeferredShortBranchRangeLimits) {
+  for (uint8_t Bits : {11, 16, 21}) {
+    const int64_t Span = int64_t(1) << (Bits - 1);
+    for (int64_t Delta : {-Span - 4, -Span, Span - 4, Span}) {
+      auto &Source = block(8);
+      Source.setAddress(orc::ExecutorAddr(4 * MiB));
+      const uint32_t Encoding = Bits == 11   ? 0xf5000000  // CBGT x0, #0
+                                : Bits == 16 ? 0x36000000  // TBZ w0, #0
+                                             : 0x54000000; // B.EQ
+      auto &Target =
+          G.addAbsoluteSymbol(("target" + Twine(Bits) + Twine(Delta)).str(),
+                              Source.getAddress() + Delta, 0, Linkage::Strong,
+                              Scope::Default, true);
+      support::endian::write32le(Source.getMutableContent(G).data(), Encoding);
+      deferredBranch(Source, 0, Target, Bits, 8, Encoding, 4);
+      auto Imported = DeferredStubLinker::importBranches(G);
+      ASSERT_TRUE(bool(Imported)) << toString(Imported.takeError());
+      ASSERT_EQ(Imported->size(), 1u);
+      EXPECT_EQ(G.findSectionByName(DeferredBranchSectionName), nullptr);
+      EXPECT_FALSE(bool(DeferredStubLinker::relaxBranches(G, *Imported)));
+      const bool Direct = Delta >= -Span && Delta < Span;
+      EXPECT_EQ(llvm::count_if(Source.edges(),
+                               [](const auto &Edge) {
+                                 return Edge.getKind() ==
+                                        aarch64::Branch26PCRel;
+                               }),
+                Direct ? 0u : 1u);
+      if (Direct) {
+        const uint32_t Mask = ((1u << (Bits - 2)) - 1) << 5;
+        EXPECT_EQ(support::endian::read32le(Source.getContent().data()),
+                  Encoding | ((uint32_t(Delta >> 2) << 5) & Mask));
+        EXPECT_EQ(support::endian::read32le(Source.getContent().data() + 4),
+                  0xd503201f);
+      }
+    }
+  }
+}
+
+TEST_F(AArch64StubBatchTest, DeferredBranchReservesLongLegBeforePlacement) {
+  auto &Source = block(12);
+  auto &Code = G.addAnonymousSymbol(Source, 0, 0, true, true);
+  deferredBranch(Source, 0, Code, 11, 12, 0xf5000000, 8, 4);
+  auto Imported = DeferredStubLinker::importBranches(G);
+  ASSERT_TRUE(bool(Imported)) << toString(Imported.takeError());
+  ASSERT_EQ(Source.edges_size(), 1u);
+  auto &LongLeg = *Source.edges().begin();
+  EXPECT_EQ(LongLeg.getKind(), aarch64::Branch26PCRel);
+  EXPECT_EQ(LongLeg.getOffset(), 8u);
+  EXPECT_EQ(LongLeg.getAddend(), 4);
+  auto Stubs = reserve();
+  ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
+  EXPECT_TRUE(Stubs->empty());
+  const auto Size = JITLinkLinker::getSectionAllocationSize(Text);
+  EXPECT_FALSE(bool(DeferredStubLinker::relaxBranches(G, *Imported)));
+  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), Size);
+  EXPECT_TRUE(llvm::none_of(
+      Source.edges(), [](const auto &Edge) { return Edge.isRelocation(); }));
+  EXPECT_EQ(support::endian::read32le(Source.getContent().data() + 4),
+            0xd503201f);
+  EXPECT_EQ(support::endian::read32le(Source.getContent().data() + 8),
+            0xd503201f);
+}
+
+TEST_F(AArch64StubBatchTest, DeferredTailTrampolineHasExactRangeCheck) {
+  auto &Source = block(1028);
+  deferredBranch(Source, 0, Far, 11, 4, 0xf5000000, 1024);
+  auto Imported = DeferredStubLinker::importBranches(G);
+  ASSERT_TRUE(bool(Imported)) << toString(Imported.takeError());
+  auto Err = DeferredStubLinker::relaxBranches(G, *Imported);
+  ASSERT_TRUE(bool(Err));
+  EXPECT_NE(toString(std::move(Err)).find("tail trampoline"),
+            std::string::npos);
+}
+
+TEST_F(AArch64StubBatchTest, DeferredTailTrampolinePreservesBody) {
+  auto &Source = block(20);
+  llvm::fill(Source.getMutableContent(G), 0);
+  support::endian::write32le(Source.getMutableContent(G).data() + 4,
+                             0xd61f0020);
+  deferredBranch(Source, 0, Far, 11, 4, 0xf5000000, 16);
+  auto Imported = DeferredStubLinker::importBranches(G);
+  ASSERT_TRUE(bool(Imported)) << toString(Imported.takeError());
+  auto Stubs = reserve();
+  ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
+  ASSERT_EQ(Stubs->size(), 1u);
+  EXPECT_FALSE(bool(DeferredStubLinker::relaxBranches(G, *Imported)));
+  EXPECT_EQ(support::endian::read32le(Source.getContent().data()), 0xf5000080);
+  EXPECT_EQ(support::endian::read32le(Source.getContent().data() + 4),
+            0xd61f0020);
+  EXPECT_EQ(Source.edges().begin()->getOffset(), 16u);
+  EXPECT_EQ(Source.edges().begin()->getKind(), aarch64::Branch26PCRel);
+}
+
+TEST_F(AArch64StubBatchTest, DeferredFixedSizeBranchIsDiagnosed) {
+  auto &Source = block(4);
+  deferredBranch(Source, 0, Far, 16, 4, 0x36000000, std::nullopt);
+  auto Imported = DeferredStubLinker::importBranches(G);
+  ASSERT_TRUE(bool(Imported)) << toString(Imported.takeError());
+  auto Err = DeferredStubLinker::relaxBranches(G, *Imported);
+  ASSERT_TRUE(bool(Err));
+  EXPECT_NE(toString(std::move(Err)).find("fixed-size patch"),
+            std::string::npos);
+}
+
+TEST_F(AArch64StubBatchTest, DeferredBranchRejectsUnalignedTarget) {
+  auto &Source = block(8);
+  deferredBranch(Source, 0, Far, 16, 8, 0x36000000, 4, 2);
+  auto Imported = DeferredStubLinker::importBranches(G);
+  ASSERT_TRUE(bool(Imported)) << toString(Imported.takeError());
+  auto Err = DeferredStubLinker::relaxBranches(G, *Imported);
+  ASSERT_TRUE(bool(Err));
+  EXPECT_NE(toString(std::move(Err)).find("Unaligned"), std::string::npos);
+}
 
 TEST_F(AArch64StubBatchTest, ForwardIslandSharesAcrossMoreThanBranchDistance) {
   // All 15 callers span 224 MiB. A slot immediately after the first caller

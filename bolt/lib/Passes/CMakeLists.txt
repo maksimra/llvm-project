@@ -30,6 +30,7 @@ add_llvm_library(LLVMBOLTPasses
   PLTCall.cpp
   PointerAuthCFIAnalyzer.cpp
   PointerAuthCFIFixup.cpp
+  PrepareDeferredBTI.cpp
   ProfileQualityStats.cpp
   RegAnalysis.cpp
   RegReAssign.cpp

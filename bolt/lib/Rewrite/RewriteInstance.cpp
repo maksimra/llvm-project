@@ -12,6 +12,7 @@
 #include "bolt/Core/BinaryEmitter.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Core/DebugData.h"
+#include "bolt/Core/DeferredStubs.h"
 #include "bolt/Core/Exceptions.h"
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Core/MCPlusBuilder.h"
@@ -2611,6 +2612,7 @@ void RewriteInstance::adjustCommandLineOptions() {
   }
 
   if (BC->isAArch64() && !opts::CompactCodeModel &&
+      !usesDeferredStubs(*BC) &&
       opts::SplitStrategy == opts::SplitFunctionsStrategy::CDSplit) {
     BC->errs() << "BOLT-ERROR: CDSplit is not supported with LongJmp. Try with "
                   "'--compact-code-model'\n";

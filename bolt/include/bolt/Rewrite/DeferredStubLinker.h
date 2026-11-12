@@ -36,11 +36,31 @@ public:
     SmallVector<Branch, 1> Branches;
   };
 
+  struct LocalBranch {
+    jitlink::Block *SourceBlock;
+    jitlink::Edge::OffsetT SourceOffset;
+    jitlink::Symbol *Target;
+    jitlink::Edge::AddendT Addend;
+    jitlink::Block *FallbackBlock;
+    jitlink::Edge::OffsetT FallbackOffset;
+    uint32_t Encoding;
+    uint8_t Bits;
+    uint8_t Size;
+  };
+
   explicit DeferredStubLinker(BinaryContext &BC) : BC(BC) {}
 
   /// Register placement after pruning and materialization before fixups.
   /// Only call for the main AArch64 ELF object emitted with fragment sections.
   void addPasses(jitlink::PassConfiguration &Config);
+
+  /// Consume emitter records and expose fallback branches before placement.
+  static Expected<std::vector<LocalBranch>>
+  importBranches(jitlink::LinkGraph &G);
+
+  /// Select direct or long forms at final addresses, without changing layout.
+  static Error relaxBranches(jitlink::LinkGraph &G,
+                             ArrayRef<LocalBranch> Branches);
 
   /// Merge private sections into logical output sections in emission order.
   static Error mergeFragmentSections(jitlink::LinkGraph &G,
@@ -57,6 +77,7 @@ public:
 private:
   BinaryContext &BC;
   std::vector<Stub> Stubs;
+  std::vector<LocalBranch> Branches;
 
   /// Repair final branches without changing block sizes or placement.
   Error materialize(jitlink::LinkGraph &G);

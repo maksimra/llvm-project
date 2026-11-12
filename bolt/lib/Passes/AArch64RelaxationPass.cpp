@@ -11,8 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Passes/AArch64RelaxationPass.h"
+#include "bolt/Core/DeferredStubs.h"
 #include "bolt/Core/ParallelUtilities.h"
 #include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/Support/MathExtras.h"
 #include <iterator>
 
 using namespace llvm;
@@ -40,6 +42,10 @@ void AArch64RelaxationPass::runOnFunction(BinaryFunction &BF) {
     return;
 
   BinaryContext &BC = BF.getBinaryContext();
+  // Deferred emission may grow the body after this pass. Use ADRP forms for
+  // movable functions instead of predicting their eventual ADR/LDR spans.
+  const bool DeferLayout =
+      usesDeferredStubs(BC) && BF.isSimple() && !BF.isPatch();
   for (BinaryBasicBlock &BB : BF) {
     for (auto It = BB.begin(); It != BB.end(); ++It) {
       MCInst &Inst = *It;
@@ -53,7 +59,7 @@ void AArch64RelaxationPass::runOnFunction(BinaryFunction &BF) {
       if (!Symbol)
         continue;
 
-      if (BF.hasIslandsInfo()) {
+      if (BF.hasIslandsInfo() && !DeferLayout) {
         BinaryFunction::IslandInfo &Islands = BF.getIslandInfo();
         if (Islands.Symbols.count(Symbol) || Islands.ProxySymbols.count(Symbol))
           continue;
@@ -61,10 +67,13 @@ void AArch64RelaxationPass::runOnFunction(BinaryFunction &BF) {
 
       // The layout of a non-simple function is preserved, so references within
       // the same fragment retain their original in-range displacement. For
-      // simple functions, basic blocks can move, but an initial size below 1MiB
-      // guarantees that internal references remain in range after reordering.
-      const unsigned OneMB = 0x100000;
-      if (!BF.isSimple() || BF.getSize() < OneMB) {
+      // simple functions in the legacy pipeline, retain the original size
+      // shortcut. Deferred emission never uses it to predict a local span.
+      const unsigned DisplacementBits = BC.MIB->getPCRelEncodingSize(Inst);
+      const bool KeepLocal =
+          !BF.isSimple() ||
+          (!DeferLayout && isUIntN(DisplacementBits - 1, BF.getSize()));
+      if (KeepLocal) {
         BinaryFunction *TargetBF = BC.getFunctionForSymbol(Symbol);
         if (TargetBF == &BF && !BB.isSplit())
           continue;
