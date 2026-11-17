@@ -1,166 +1,69 @@
-# Deferred local branch relaxation investigation
+# Deferred local branch relaxation
 
-## Scope and comparison
+Local relaxation is enabled only by the emitter call inside
+`RewriteInstance::emitAndLink()`. `LongJmpPass` retains its deferred-mode early
+return. There is no public planning object, candidate engine or custom scheduler.
 
-The working change is based on `c3285cb84105` on `deferred-stub-creation`.
-`LongJmpPass` keeps its early deferred-mode return (after BTI preparation).
-All local relaxation decisions now run inside `RewriteInstance::emitAndLink`,
-including parallel planning of the fragments that are actually emitted.
+The late algorithm follows `LongJmpPass::relaxLocalBranches`:
 
-The source comparison is `git diff 1293726 9db19db`. In 1293726,
-`relaxLocalBranches` first splits terminal B instructions into trampoline BBs,
-without adding bytes. It reuses a reachable trampoline to the same target BB,
-then tries an end trampoline for a zero-count taken edge. Failing these, it
-inverts a reversible branch with a fall-through successor and inserts a B;
-an irreversible predicate needs an additional branch to protect fall-through.
-It updates the CFG and subsequently finalizes unwind state.
+1. Lay out the fragment, accounting for MC alignment budgets and body prefixes.
+2. Register terminal B instructions and B's introduced by earlier expansion as
+   reusable trampolines.
+3. For a far conditional, first reuse a reachable B to the same symbol/addend.
+4. For a zero-count taken edge, try a shared end-of-fragment trampoline.
+5. Otherwise expand inline, preserving flags for irreversible CMPBR predicates.
+6. Repeat until the selected branches fit, recomputing the full layout only
+   after inline growth; otherwise revisit the recorded branch references.
 
-9db19db moves local relaxation into serial emission. For simple functions it
-always expands far conditionals inline, never reusing B sites or outlining
-cold edges. Its repeated layout/decision passes scan every instruction. For
-non-simple functions it shares end trampolines by symbol/addend. c3285cb fixes
-the deliberately conservative alignment accounting in 9db19db, using exact MC
-padding and prefix offsets, but retains the same branch selection and rescans.
+The conditional/B pair optimization additionally uses `B.!cond near; B far`
+when near fits the short encoding. A failed reuse or pair choice is rechecked
+and falls back to inline expansion. Unrecognized expressions retain their full
+operand and cannot use sharing or local range proofs.
 
-The late planner transfers reachable-B reuse and cold-edge outlining, without
-splitting or moving original instructions. It additionally swaps the two
-instructions of `B.cond far; B near` when a short inversion reaches near.
-Every selected destination is rechecked after growth; failed choices fall back
-to monotonic inline expansion. Reuse groups include the addend and CFI epoch.
-A reused B that changes destination through a pair swap is revalidated too.
+The old pass splits BBs before CFI finalization. The late version instead leaves
+original instructions and their PC/CFI labels in place. Reuse requires no CFI
+change between source and trampoline. End trampolines save source rows and
+restore them in reverse source order; GNU_args_size is emitted explicitly.
+Opaque CFI and differing unwind rows at a fall-through continuation disable
+outlining. Fixed-footprint patches cannot acquire extra instructions.
 
-## Profile and unwind evidence
+InstructionLowering preserves successor vectors and counts but removes tail-call
+annotations. Cold-edge decisions therefore require a valid function profile,
+a matching successor and zero addend. Normalized zero counts alone are not
+profile evidence. External lowered tail calls do not provide such an edge.
 
-InstructionLowering only lowers tail calls; successor vectors and their
-BinaryBranchInfo counts survive. CFG analyses based on call/tail-call opcodes
-are no longer valid. The planner reads a zero count only with a valid function
-profile, a matching successor symbol, and zero addend. BB counts alone are
-insufficient: normalization can produce zero counts without input profile.
-External lowered tail calls have no trustworthy successor edge.
+Parallelism uses the existing BOLT runOnEachFunction scheduler. Each function's
+fragments are processed independently; injected functions are included through
+the output list. Workers only read instructions/CFG/expressions. Constant-island
+symbol preparation, label creation and MCStreamer operations remain serial.
 
-Reused B sites require an identical CFI epoch within their fragment. This is
-conservative: equivalent rows reached through different CFI instructions are
-not recognized. It includes PAC state and opaque escape directives in the
-equality proof. New end trampolines use remember_state at their sources and
-restore_state in reverse source order. GNU_args_size is restored separately.
-The original epilogue's unwind row is therefore not used for the new B.
-Opaque CFI or existing remember/restore sequences disable outlining; a
-fall-through continuation also requires the source and end epochs to agree.
-Inline expansion remains available for simple functions in these cases.
-Non-simple functions diagnose an unreachable or unsafe end trampoline.
-Fixed-footprint patches may reuse existing instructions but cannot grow.
+The supplied Clang timing increase is 24.7 s, entirely within emit/link. Moving
+work into that timer does not by itself identify the new planner's cost.
+Ten reserved slots contribute 200 bytes directly out of the 63484-byte growth;
+the rest requires attribution to emitted instructions and alignment. Cold-edge
+inversion and redundant B instructions can change dynamic branch behavior, but
+the reported 33% branch-miss increase and 96.2-to-101.0 s TU slowdown still need
+the original AArch64 Clang/profile/TU and target-machine measurements.
 
-## Parallelism and work bound
+Validation artifacts for this rewrite are in `/tmp/bolt-local-transfer`.
 
-BinaryEmissionPlan uses the same emission predicates and output list as the
-emitter, including injected functions omitted by runOnEachFunction's input map.
-Serial preparation handles function prefixes, break markers and constant-island
-symbol rewriting. Workers use only const instruction/opcode/annotation reads,
-const BB label/edge lookups and private containers. Symbolic addends are decoded
-without MCExpr evaluation, which can modify variable-symbol state. Unknown
-expressions cannot use range proofs or trampoline sharing; the emitted B keeps
-the complete original operand. No MCContext/MCStreamer mutation or diagnostic
-emission occurs in workers. Symbol creation and application happen in original
-emission order, after pool.wait().
+Validation: 67 CoreTests passed (33 architecture skips); the broad AArch64 run
+passed 129 tests, excluding the seven known Clang input-compilation failures and
+two slow non-deferred tests. After the offset-cache change, all four focused
+local-branch tests and CoreTests passed again. The shape regression now also
+checks reuse of a B introduced by an earlier inline expansion. Twelve existing
+CFI/DWARF/LSDA tests passed. Executable sections, DWARF 4/5, CFI, LSDA, BAT and
+function symbols match with one and four threads; DWARF and LSDA checks passed.
 
-The pool is ParallelUtilities::getThreadPool(), with BOLT's thread/task options.
-Jobs group at least 32768 instructions to bound small-fragment scheduling costs.
-One initial instruction walk records candidate positions and BB byte sizes.
-Each cascade iteration recomputes all block offsets, including exact bounded or
-unlimited alignment, but only visits branch sites inside the blocks. The fast
-path uses the concrete opcode's signed range (CMPBR, TBZ, CBZ/B.cond), maximum
-possible inline growth and alignment padding. It excludes cross-fragment
-references and nonzero/unrecognized addends. New end-trampoline ranks account
-for reverse source order without repeated vector insertion/offset updates.
+On the 128-function/16 MiB fixture, three-run median emit/link times are:
 
-## Interpretation of the supplied Clang numbers
+| Local relaxation | 1 thread | 4 threads |
+| --- | ---: | ---: |
+| 9db19db | 0.4135 s | 0.3797 s |
+| Simplified late loop | 0.3384 s | 0.3146 s |
 
-The supplied total increase is 24.7 s (5.84%); emit/link increases by the same
-24.7 s (14.68%). The remaining measured phases sum to 254.7 s in both runs.
-This localizes the observed increase to emit/link, but moving work from the old
-parallel pass into that timer means the timer difference is not itself the
-cost of the new planner. Repeated whole-instruction scans and serialization
-are supported by the source comparison and synthetic measurements below.
-
-Each reserved slot occupies 20 bytes. Ten additional slots contribute only
-200 of the 63484 extra code-section bytes, leaving 63284 bytes attributable to
-other layout/code/alignment changes. The slot count alone cannot explain the
-size difference. A complete byte attribution requires the two Clang outputs.
-
-For a cold taken edge, inline inversion turns the formerly hot fall-through
-into a taken conditional branch. A conditional/B pair can also gain a redundant
-B with the 9db19db form. The regressions demonstrate both changes in instruction
-shape and their removal. They support the branch-behavior hypothesis but do not
-establish the cause of the reported 33% branch-miss increase or the TU slowdown
-from 96.2 to 101.0 s (4.99%). That needs the original AArch64 Clang/profile/TU,
-repeated target-machine runs and branch-PC attribution. Those inputs are not
-available in this workspace; this x86 host cannot provide native AArch64
-runtime measurements.
-
-## Reproduction and validation artifacts
-
-Builds and logs are isolated under `/tmp/bolt-late-plans`; installed build
-outputs were not overwritten. `build.py` uses the configured Release/assertions
-compile commands and existing LLVM/BOLT archives. Historical emitter/LongJmp
-variants use common supporting libraries to isolate relaxation policy; the
-saved source files for the old variant match 1293726 exactly. These are focused
-comparisons, not complete fresh LLVM builds of each historical commit.
-
-`make-benchmark.py` generates 128 AArch64 functions, each with 32768 NOPs, a
-conditional/B pair moved out of short range by reverse BB order, and an FDE.
-`benchmark.py` alternates variants and runs three repetitions at 1 and 4 threads.
-Results are timer wall times, not CPU-time sums. This is a planning/emission
-microbenchmark, not a Clang throughput benchmark.
-
-Median seconds from the final three runs (1 thread / 4 threads):
-
-| Variant | emit/link | BOLT timed region | Whole process wall |
-| --- | ---: | ---: | ---: |
-| 1293726 policy | 0.3256 / 0.3480 | 2.9016 / 2.6332 | 5.1249 / 4.3591 |
-| 9db19db policy | 0.4550 / 0.5209 | 2.4737 / 2.4942 | 4.5147 / 3.8974 |
-| Working plans | 0.3504 / 0.3347 | 2.4171 / 2.2555 | 4.5485 / 3.6319 |
-
-The new planning timer measures 0.0502 / 0.0226 s (2.22x speedup).
-Emit/link is 23.0% / 35.7% below 9db19db on this fixture. The whole-process
-one-thread time does not improve; three runs on a shared laptop are insufficient
-to claim a small end-to-end gain. The emit/link samples range from 0.3405 to
-0.4262 s at one thread and 0.3174 to 0.3664 s at four threads. Earlier measurements
-are kept in `benchmark-initial.json`; they also show an emit/link reduction.
-Parent 1293726 plans before the emit/link timer, so that column alone cannot be
-used to compare its total relaxation cost with late planning.
-
-The new code is 16780800 bytes versus 16781312 (512 fewer bytes, four per
-function). All variants reserve zero slots in this fixture. This directly
-measures the conditional/B pair optimization, independently of stub counts.
-It does not reproduce the production Clang size difference.
-
-Raw commands and results are in `benchmark.json`, individual logs,
-`core-final.log`, `focused-final.log`, `aarch64*.log`, `x86-metadata.log`, and
-`determinism-final.log`.
-
-- CoreTests: 67 passed, 33 architecture-dependent skips.
-- Four focused local-branch tests passed, including TBZ cascades, exact BB
-  alignment/budgets/prefixes, live-flags CMPBR, hot/cold fragments, non-simple
-  functions, reachable-B reuse, pair inversion, source-specific PAC/CFA rows,
-  reverse-order CMPBR end-trampoline range, and DWARF 4/5/LSDA semantics.
-- Unit coverage includes an injected function absent from the input map,
-  `(symbol + 16) - 4` in a trampoline relocation, a four-byte fall-through patch
-  retaining its exact footprint, and rejection of an unrelaxable patch branch.
-- Twelve existing X86 CFI/DWARF/LSDA tests passed.
-- AArch64, consolidated across the full run and focused/serial reruns:
-  131 passed, nine unsupported, seven input-compilation failures with the
-  installed Clang (CMPBR/CREL/pauth-lr/defsym). Those same seven failures
-  reproduce with the historical baseline before BOLT runs. Two ordinary
-  --relax-exp tests initially exceeded the default 60-second timeout; both
-  passed in a separate serial run with a 240-second limit (77.05 s together).
-  See `aarch64.log`, `aarch64-final.log`, `focused-final.log`,
-  `toolchain-baseline.log` and `slow-retry.log`.
-- The final rank/addend changes were rechecked with CoreTests and all four
-  focused tests, including the CMPBR end-trampoline displacement boundary.
-- `determinism.py` links the DWARF/LSDA fixture with the 128-function workload,
-  ensuring workers really run in parallel. With --no-threads/1 thread versus
-  four threads, all executable sections, CFI, LSDA, DWARF, BAT, and 130 function
-  symbols match: ten sections for DWARF 4 and twelve for DWARF 5. Both outputs
-  pass llvm-dwarfdump --verify and the semantic LSDA checker.
-- git diff --check passed. No ThreadSanitizer run or native AArch64 runtime
-  performance measurement was performed.
+The fixture emits 512 fewer code bytes and reserves zero slots in both variants.
+Historical emitter/LongJmp variants use common supporting libraries. These are
+synthetic measurements, not a repeat of the supplied Clang/TU benchmark.
+Commands, raw timings and validation logs are in `/tmp/bolt-local-transfer`.
+`git diff --check` passes.

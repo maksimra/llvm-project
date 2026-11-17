@@ -170,8 +170,7 @@ TEST_P(MCPlusBuilderTester, DeferredInjectedBranchAddend) {
   SmallString<0> Buffer;
   raw_svector_ostream OS(Buffer);
   auto Streamer = BC->createStreamer(OS);
-  BinaryEmissionPlan Plan(*BC);
-  emitBinaryContext(*Streamer, *BC, "", Plan);
+  emitBinaryContext(*Streamer, *BC, "", /*RelaxBranches=*/true);
   Streamer->finish();
   ASSERT_FALSE(BC->Ctx->hadError());
   auto Object = cantFail(ObjectFile::createObjectFile(
@@ -232,8 +231,7 @@ TEST_P(MCPlusBuilderTester, DeferredPatchCannotGrow) {
   BC->Ctx->setDiagnosticHandler(
       [&](const SMDiagnostic &D, bool, const SourceMgr &,
           std::vector<const MDNode *> &) { Error = D.getMessage().str(); });
-  BinaryEmissionPlan Plan(*BC);
-  emitBinaryContext(*Streamer, *BC, "", Plan);
+  emitBinaryContext(*Streamer, *BC, "", /*RelaxBranches=*/true);
   EXPECT_TRUE(BC->Ctx->hadError());
   EXPECT_NE(Error.find("fixed-size patch cannot grow"), std::string::npos);
   EXPECT_FALSE(BF->isEmitted());

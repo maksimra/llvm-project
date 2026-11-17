@@ -20,8 +20,7 @@
 #include "bolt/Core/ParallelUtilities.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/DebugInfo/DWARF/DWARFCompileUnit.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
@@ -125,112 +124,46 @@ bool fragmentMayFallThrough(const FunctionFragment &Fragment,
   return false;
 }
 
-/// Plans contain only references to immutable, lowered instructions. In
-/// particular, querying opcode properties, targets, annotations and the
-/// surviving successor counts does not allocate in MCContext or MCPlusBuilder.
-/// Do not use CFG analyses that interpret lowered tail calls as ordinary edges.
+/// The fragment-local algorithm from LongJmpPass::relaxLocalBranches, applied
+/// at emission without splitting finalized BBs or moving their CFI/PC labels.
 class LocalBranchRelaxation {
   BinaryContext &BC;
-  using Destination = std::pair<const MCSymbol *, int64_t>;
-  enum Kind { Direct, Reuse, Outline, Swap, Inline };
-  static constexpr unsigned Invalid = ~0U;
+  using Target = std::pair<const MCSymbol *, int64_t>;
+  using Key = std::pair<Target, unsigned>;
+  DenseSet<const MCInst *> Inline, Outlined;
+  SmallVector<const MCInst *, 0> LabelOrder;
+  DenseMap<const MCInst *, const MCInst *> Redirects, Swaps, SwapJumps;
+  SmallVector<const MCInst *, 0> Trampolines;
+  DenseMap<const MCInst *, MCSymbol *> Labels, ReusedLabels;
+  DenseMap<const MCInst *, uint64_t> ArgsSizes;
+  const MCInst *Error = nullptr;
+  bool HasCFI = false, HasArgs = false, Guard = false;
+  MCSymbol *End = nullptr;
 
-  struct Block {
-    uint64_t Size = 0;
-    uint64_t Growth = 0;
-    uint64_t Offset = 0;
-    Align Alignment = Align(1);
-    unsigned MaxPadding = 0;
-  };
-  struct Site {
-    const MCInst *Inst;
-    unsigned BlockIndex;
-    unsigned CFIEpoch;
-    uint64_t InBlock;
-    uint64_t Offset = 0;
-    unsigned CandidateIndex = Invalid;
-    uint64_t ArgsSize = 0;
-  };
-  struct Candidate {
-    unsigned SiteIndex;
-    unsigned TargetBlock;
-    Destination Target;
-    unsigned Bits;
-    bool Reversible;
-    bool Cold;
-    bool ProvenDirect = false;
-    Kind Form = Direct;
-    unsigned Via = Invalid;
-    unsigned Pair = Invalid;
-  };
-  struct Trampoline {
-    unsigned Source;
-    uint64_t Offset = 0;
-    bool Active = false;
-  };
-  struct Action {
-    Kind Form;
-    const MCInst *TargetInst = nullptr;
-    MCSymbol *Label = nullptr;
-  };
-  struct EmittedTrampoline {
-    const MCInst *Source;
-    uint64_t ArgsSize;
-  };
-  DenseMap<const MCInst *, Action> Actions;
-  // Ordered by source position, independently of task/relaxation order.
-  SmallVector<const MCInst *, 0> ReusedBranches;
-  SmallVector<EmittedTrampoline, 0> Trampolines;
-  DenseMap<const MCInst *, MCSymbol *> Labels;
-  DenseMap<const MCInst *, MCSymbol *> ReusedLabels;
-  DenseMap<const MCInst *, unsigned> SavedCFI;
-  const MCInst *ErrorInst = nullptr;
-  const char *ErrorMessage = nullptr;
-  bool NeedsFDE = false;
-  bool NeedsArgsSize = false;
-  bool NeedsGuard = false;
-  MCSymbol *TrampolinesEnd = nullptr;
-
-  Destination destination(const MCInst &Inst) const {
-    const MCOperand &Op =
-        Inst.getOperand(MCPlus::getNumPrimeOperands(Inst) - 1);
-    if (!Op.isExpr())
-      return {nullptr, 0};
-    const MCExpr *Expr = Op.getExpr();
+  static Target target(const MCInst &Inst) {
+    const MCExpr *Expr =
+        Inst.getOperand(MCPlus::getNumPrimeOperands(Inst) - 1).getExpr();
     uint64_t Addend = 0;
-    // Decode symbol +/- constants without MCExpr evaluation: evaluating a
-    // variable symbol can update MC state and is not safe in these workers.
-    // The MIB addend helper only recognizes a single RHS of an addition.
-    while (const auto *Binary = dyn_cast<MCBinaryExpr>(Expr)) {
-      const auto *Constant = dyn_cast<MCConstantExpr>(Binary->getRHS());
-      if (!Constant || (Binary->getOpcode() != MCBinaryExpr::Add &&
-                        Binary->getOpcode() != MCBinaryExpr::Sub))
+    // Read symbol +/- constants directly; MCExpr evaluation can modify symbols.
+    while (const auto *B = dyn_cast<MCBinaryExpr>(Expr)) {
+      const auto *C = dyn_cast<MCConstantExpr>(B->getRHS());
+      if (!C || (B->getOpcode() != MCBinaryExpr::Add &&
+                 B->getOpcode() != MCBinaryExpr::Sub))
         return {nullptr, 0};
-      if (Binary->getOpcode() == MCBinaryExpr::Add)
-        Addend += uint64_t(Constant->getValue());
-      else
-        Addend -= uint64_t(Constant->getValue());
-      Expr = Binary->getLHS();
+      Addend += B->getOpcode() == MCBinaryExpr::Add ? uint64_t(C->getValue())
+                                                    : -uint64_t(C->getValue());
+      Expr = B->getLHS();
     }
-    const auto *Symbol = dyn_cast<MCSymbolRefExpr>(Expr);
-    if (!Symbol || Symbol->getSpecifier())
-      return {nullptr, 0};
-    return {&Symbol->getSymbol(), int64_t(Addend)};
+    const auto *S = dyn_cast<MCSymbolRefExpr>(Expr);
+    return S && !S->getSpecifier() ? Target{&S->getSymbol(), int64_t(Addend)}
+                                   : Target{nullptr, 0};
   }
 
-  static bool inRange(unsigned Bits, uint64_t From, uint64_t To,
-                      int64_t Addend = 0) {
-    // AArch64 branch displacements are signed byte offsets, scaled by four.
-    const uint64_t Offset = To + uint64_t(Addend) - From;
-    return !(Offset & 3) && isIntN(Bits, Offset);
-  }
-
-  MCInst createJump(const MCInst &Inst) const {
-    MCInst Jump;
-    BC.MIB->createUncondBranch(Jump, BC.MIB->getTargetSymbol(Inst),
-                               BC.Ctx.get());
-    Jump.getOperand(0) = Inst.getOperand(MCPlus::getNumPrimeOperands(Inst) - 1);
-    return Jump;
+  MCInst jump(const MCInst &Inst) const {
+    MCInst B;
+    BC.MIB->createUncondBranch(B, BC.MIB->getTargetSymbol(Inst), BC.Ctx.get());
+    B.getOperand(0) = Inst.getOperand(MCPlus::getNumPrimeOperands(Inst) - 1);
+    return B;
   }
 
 public:
@@ -238,535 +171,303 @@ public:
 
   void run(const BinaryFunction &BF, const FunctionFragment &FF,
            uint64_t BodyOffset) {
+    DenseMap<const BinaryBasicBlock *, uint64_t> Blocks;
+    DenseMap<const MCInst *, uint64_t> Offsets;
+    DenseMap<const MCInst *, unsigned> CFI;
+    DenseMap<Key, const MCInst *> FragmentTrampolines, SymbolTrampolines;
     const bool PreserveLayout = !BF.isSimple() || BF.isPatch();
-    NeedsFDE = BF.hasCFI() && !(BF.isPatch() && BF.isAnonymous());
-    NeedsArgsSize = BF.usesGnuArgsSize();
-    const bool MayFallThrough = fragmentMayFallThrough(FF, BC);
-    SmallVector<Block, 0> Blocks;
-    SmallVector<Site, 0> Sites;
-    SmallVector<Candidate, 0> Candidates;
-    SmallVector<unsigned, 0> Jumps;
-    SmallVector<Trampoline, 0> Thunks;
-    DenseMap<const BinaryBasicBlock *, unsigned> BlockIndices;
-    unsigned CFIEpoch = 0;
-    bool HasCFIStack = false;
-    uint64_t ArgsSize = 0;
-    uint64_t MaximumSize = 0;
-
-    // One instruction walk: collect byte sizes, alignment constraints, branch
-    // candidates and their original positions. Subsequent iterations visit
-    // only blocks and branch sites, never all the instructions again.
-    for (const BinaryBasicBlock *BB : FF) {
-      const unsigned BI = Blocks.size();
-      BlockIndices[BB] = BI;
-      Blocks.emplace_back();
-      Block &B = Blocks.back();
-      if (BC.AlignBlocks || BC.PreserveBlocksAlignment) {
-        B.Alignment = BB->getAlign();
-        B.MaxPadding = BB->getAlignmentMaxBytes();
-      }
-      unsigned Previous = Invalid;
-      for (const MCInst &Inst : *BB) {
-        if (BC.MIB->isCFI(Inst)) {
-          ++CFIEpoch;
-          const auto Op = BF.getCFIFor(Inst)->getOperation();
-          HasCFIStack |= Op == MCCFIInstruction::OpRememberState ||
-                         Op == MCCFIInstruction::OpRestoreState ||
-                         Op == MCCFIInstruction::OpEscape;
-          if (Op == MCCFIInstruction::OpGnuArgsSize)
-            ArgsSize = BF.getCFIFor(Inst)->getOffset();
-        }
-        if (BC.MIB->isPseudo(Inst))
-          continue;
-        if (BC.MIB->isConditionalBranch(Inst)) {
-          const unsigned SI = Sites.size();
-          Sites.push_back(
-              {&Inst, BI, CFIEpoch, B.Size, 0, unsigned(Candidates.size())});
-          Sites.back().ArgsSize = ArgsSize;
-          const Destination Target = destination(Inst);
-          const BinaryBasicBlock *TargetBB =
-              BF.getBasicBlockForLabel(Target.first);
-          bool Cold = false;
-          // Lowering preserves successor counts, but removes conditional
-          // tail-call annotations. Only trust a count for an actual matching
-          // CFG edge, with no addend into the middle of a block.
-          if (!Target.second && TargetBB && BF.hasValidProfile() &&
-              BB->hasProfile() && BB->getSuccessor(Target.first) == TargetBB)
-            Cold = BB->getBranchInfo(*TargetBB).Count == 0;
-          Candidates.push_back({SI, Invalid, Target,
-                                unsigned(BC.MIB->getPCRelEncodingSize(Inst)),
-                                BC.MIB->isReversibleBranch(Inst), Cold});
-          // Filled after all blocks have been indexed.
-          if (PreserveLayout && TargetBB && !Target.second)
-            Candidates.back().ProvenDirect = true;
-          Previous = SI;
-          MaximumSize += Candidates.back().Reversible ? 4 : 8;
-        } else if (BC.MII->get(Inst.getOpcode()).isUnconditionalBranch() &&
-                   !BC.MIB->isIndirectBranch(Inst)) {
-          const unsigned SI = Sites.size();
-          Sites.push_back({&Inst, BI, CFIEpoch, B.Size});
-          Jumps.push_back(SI);
-          if (Previous != Invalid && Sites[Previous].CFIEpoch == CFIEpoch)
-            Candidates[Sites[Previous].CandidateIndex].Pair = SI;
-          Previous = Invalid;
-        } else {
-          Previous = Invalid;
-        }
-        B.Size += 4;
-      }
-      MaximumSize +=
-          B.Size + (B.MaxPadding ? std::min<uint64_t>(B.Alignment.value() - 1,
-                                                      B.MaxPadding)
-                                 : B.Alignment.value() - 1);
-    }
-    if (Candidates.empty())
-      return;
-
-    for (Candidate &C : Candidates) {
-      const auto *BB = BF.getBasicBlockForLabel(C.Target.first);
-      auto It = BlockIndices.find(BB);
-      if (It != BlockIndices.end())
-        C.TargetBlock = It->second;
-      // Upper bound includes every possible inline expansion and maximum BB
-      // padding (including unlimited budgets). Cross-fragment targets and
-      // addends cannot use this fast path. Use each opcode's own range.
-      C.ProvenDirect |= C.TargetBlock != Invalid && !C.Target.second &&
-                        MaximumSize < (uint64_t(1) << (C.Bits - 1));
-    }
-    if (llvm::all_of(Candidates,
-                     [](const Candidate &C) { return C.ProvenDirect; }))
-      return;
-
-    auto extraSize = [&](const Candidate &C) -> unsigned {
-      return C.Form == Inline ? (C.Reversible ? 4 : 8) : 0;
+    HasCFI = BF.hasCFI() && !(BF.isPatch() && BF.isAnonymous());
+    HasArgs = BF.usesGnuArgsSize();
+    auto actualTarget = [&](const MCInst *Inst) {
+      const MCInst *Original = SwapJumps.lookup(Inst);
+      return target(Original ? *Original : *Inst);
     };
-    SmallVector<unsigned, 0> ThunkOrder;
-    uint64_t CodeSize = 0;
-    auto layout = [&]() {
-      CodeSize = BodyOffset;
-      for (Block &B : Blocks) {
-        const uint64_t Pad = offsetToAlignment(CodeSize, B.Alignment);
-        if (!B.MaxPadding || Pad <= B.MaxPadding)
-          CodeSize += Pad;
-        B.Offset = CodeSize;
-        CodeSize += B.Size + B.Growth;
-      }
-      unsigned BI = Invalid;
-      uint64_t Growth = 0;
-      for (Site &S : Sites) {
-        if (BI != S.BlockIndex) {
-          BI = S.BlockIndex;
-          Growth = 0;
-        }
-        S.Offset = Blocks[BI].Offset + S.InBlock + Growth;
-        if (S.CandidateIndex != Invalid)
-          Growth += extraSize(Candidates[S.CandidateIndex]);
-      }
-      for (Trampoline &T : Thunks)
-        T.Active = false;
-      for (const Candidate &C : Candidates)
-        if (C.Form == Outline)
-          Thunks[C.Via].Active = true;
-      ThunkOrder.clear();
-      for (unsigned I = 0; I < Thunks.size(); ++I)
-        if (Thunks[I].Active)
-          ThunkOrder.push_back(I);
-      llvm::sort(ThunkOrder, [&](unsigned L, unsigned R) {
-        return Thunks[L].Source > Thunks[R].Source;
-      });
-      uint64_t End = CodeSize + (!ThunkOrder.empty() && MayFallThrough ? 4 : 0);
-      for (unsigned I : ThunkOrder) {
-        Thunks[I].Offset = End;
-        End += 4;
-      }
-    };
-    auto jumpDestination = [&](unsigned SI) {
-      // Swapping a conditional/B pair changes the B's destination. Users of
-      // that B must be revalidated on the next iteration too.
-      if (SI && Sites[SI - 1].CandidateIndex != Invalid) {
-        const Candidate &C = Candidates[Sites[SI - 1].CandidateIndex];
-        if (C.Form == Swap && C.Pair == SI)
-          return C.Target;
-      }
-      return destination(*Sites[SI].Inst);
-    };
-    bool Changed;
+    SmallVector<std::pair<const BinaryBasicBlock *, const MCInst *>, 0>
+        Branches;
+    uint64_t Size = 0;
+    unsigned Epoch = 0, MinBits = 63;
+    bool OpaqueCFI = false, AllLocal = true, LayoutChanged = true, Changed;
     do {
-      layout();
-      Changed = false;
-      using ReuseKey = std::pair<Destination, unsigned>;
-      DenseMap<ReuseKey, SmallVector<unsigned, 1>> Reusable;
-      for (unsigned SI : Jumps) {
-        const Destination Target = jumpDestination(SI);
-        if (Target.first)
-          Reusable[{Target, Sites[SI].CFIEpoch}].push_back(SI);
-      }
-      DenseMap<ReuseKey, SmallVector<unsigned, 1>> Outlined;
-      for (unsigned I : ThunkOrder) {
-        const Site &Owner = Sites[Thunks[I].Source];
-        Outlined[{Candidates[Owner.CandidateIndex].Target, Owner.CFIEpoch}]
-            .push_back(I);
-      }
-      // New sources are visited in increasing order. Keep their ranks apart
-      // from the existing reverse-source order, avoiding quadratic insertion
-      // and offset updates when many cold edges acquire end trampolines.
-      SmallVector<unsigned, 0> NewThunkSources;
-      auto thunkOffset = [&](unsigned I) {
-        const auto After = llvm::upper_bound(NewThunkSources, Thunks[I].Source);
-        return Thunks[I].Offset + 4 * (NewThunkSources.end() - After);
-      };
-
-      for (Candidate &C : Candidates) {
-        if (C.ProvenDirect || C.Form == Inline)
-          continue;
-        const Site &S = Sites[C.SiteIndex];
-        auto reaches = [&](uint64_t To, int64_t Addend = 0) {
-          return inRange(C.Bits, S.Offset, To, Addend);
-        };
-        if (C.Form == Direct && C.TargetBlock != Invalid &&
-            reaches(Blocks[C.TargetBlock].Offset, C.Target.second))
-          continue;
-        if (C.Form == Reuse && jumpDestination(C.Via) == C.Target &&
-            reaches(Sites[C.Via].Offset))
-          continue;
-        if (C.Form == Outline && reaches(thunkOffset(C.Via)))
-          continue;
-        if (C.Form == Swap) {
-          const Destination Near = destination(*Sites[C.Pair].Inst);
-          auto It = BlockIndices.find(BF.getBasicBlockForLabel(Near.first));
-          if (It != BlockIndices.end() &&
-              reaches(Blocks[It->second].Offset, Near.second))
-            continue;
-        }
-
-        // Like LongJmp, first reuse a reachable B with the exact destination.
-        // Reusing an instruction does not move its labels or its CFIs. A CFI
-        // epoch match conservatively proves identical unwind rules, including
-        // signed RA state, without interpreting arbitrary DW_CFA_expression.
-        if (C.Form == Direct) {
-          auto UseJump = [&](unsigned SI) {
-            if (jumpDestination(SI) != C.Target)
-              return false;
-            C.Form = Reuse;
-            C.Via = SI;
-            Changed = true;
-            return true;
-          };
-          auto ReusableIt = Reusable.find({C.Target, S.CFIEpoch});
-          if (ReusableIt != Reusable.end()) {
-            const auto &Group = ReusableIt->second;
-            auto Mid = llvm::lower_bound(Group, S.Offset,
-                                         [&](unsigned SI, uint64_t Offset) {
-                                           return Sites[SI].Offset < Offset;
-                                         });
-            for (auto I = Mid; I != Group.end() && reaches(Sites[*I].Offset);
-                 ++I)
-              if (UseJump(*I))
-                break;
-            if (C.Form != Reuse)
-              for (auto I = std::make_reverse_iterator(Mid);
-                   I != Group.rend() && reaches(Sites[*I].Offset); ++I)
-                if (UseJump(*I))
-                  break;
+      if (LayoutChanged) {
+        const bool Collect = Branches.empty();
+        Size = BodyOffset;
+        uint64_t ArgsSize = 0;
+        Epoch = 0;
+        // As in LongJmp, compute fragment offsets and pre-populate trampolines
+        // from terminal B instructions. Keep those instructions in place.
+        for (const BinaryBasicBlock *BB : FF) {
+          if (BC.AlignBlocks || BC.PreserveBlocksAlignment) {
+            const uint64_t Pad = offsetToAlignment(Size, BB->getAlign());
+            if (!BB->getAlignmentMaxBytes() ||
+                Pad <= BB->getAlignmentMaxBytes())
+              Size += Pad;
           }
-          if (C.Form == Reuse)
+          Blocks[BB] = Size;
+          for (const MCInst &Inst : *BB) {
+            if (const auto *C = BF.getCFIFor(Inst)) {
+              ++Epoch;
+              OpaqueCFI |=
+                  C->getOperation() == MCCFIInstruction::OpEscape ||
+                  C->getOperation() == MCCFIInstruction::OpRememberState ||
+                  C->getOperation() == MCCFIInstruction::OpRestoreState;
+              if (C->getOperation() == MCCFIInstruction::OpGnuArgsSize)
+                ArgsSize = C->getOffset();
+            }
+            if (BC.MIB->isPseudo(Inst))
+              continue;
+            if (BC.MII->get(Inst.getOpcode()).isBranch() &&
+                !BC.MIB->isIndirectBranch(Inst)) {
+              Offsets[&Inst] = Size;
+              CFI[&Inst] = Epoch;
+              ArgsSizes[&Inst] = ArgsSize;
+            }
+            if (BC.MIB->isConditionalBranch(Inst)) {
+              if (Collect)
+                Branches.emplace_back(BB, &Inst);
+              const Target T = target(Inst);
+              const auto *TargetBB = BF.getBasicBlockForLabel(T.first);
+              AllLocal &= TargetBB && !T.second &&
+                          TargetBB->getFragmentNum() == FF.getFragmentNum();
+              MinBits = std::min<unsigned>(MinBits,
+                                           BC.MIB->getPCRelEncodingSize(Inst));
+            }
+            Size += 4;
+            if (Inline.contains(&Inst))
+              Size += BC.MIB->isReversibleBranch(Inst) ? 4 : 8;
+          }
+        }
+      }
+      LayoutChanged = false;
+      FragmentTrampolines.clear();
+      // Pre-populate B trampolines and retain B's introduced by expansion.
+      for (const BinaryBasicBlock *BB : FF) {
+        const MCInst *B = BB->getLastNonPseudoInstr();
+        if (B && BC.MII->get(B->getOpcode()).isUnconditionalBranch() &&
+            actualTarget(B).first)
+          FragmentTrampolines.try_emplace(Key{actualTarget(B), CFI.lookup(B)},
+                                          B);
+      }
+      for (const auto &[BB, Inst] : Branches)
+        if (Inline.contains(Inst) && !Outlined.contains(Inst) &&
+            target(*Inst).first)
+          FragmentTrampolines.try_emplace(Key{target(*Inst), CFI.lookup(Inst)},
+                                          Inst);
+      // LongJmp's small-fragment shortcut, using the actual opcode range and
+      // exact padding. If all targets fit here, no branch can initiate growth.
+      if (Redirects.empty() && Swaps.empty() && Inline.empty() && AllLocal &&
+          Size - BodyOffset < (uint64_t(1) << (MinBits - 1)))
+        return;
+      const bool FallThrough = fragmentMayFallThrough(FF, BC);
+      auto endOffset = [&](const MCInst *Source) {
+        return Size + (FallThrough ? 4 : 0) +
+               4 * llvm::count_if(Trampolines, [&](const MCInst *Other) {
+                 return Offsets.lookup(Other) > Offsets.lookup(Source);
+               });
+      };
+      auto trampolineOffset = [&](const MCInst *Source) {
+        if (Outlined.contains(Source))
+          return endOffset(Source);
+        return Offsets.lookup(Source) +
+               (Inline.contains(Source)
+                    ? (BC.MIB->isReversibleBranch(*Source) ? 4 : 8)
+                    : 0);
+      };
+      Changed = false;
+      for (const auto &[BB, InstPtr] : Branches) {
+        const MCInst &Inst = *InstPtr;
+        if (!BC.MIB->isConditionalBranch(Inst) || Inline.contains(&Inst))
+          continue;
+        const Target T = target(Inst);
+        const BinaryBasicBlock *TargetBB = BF.getBasicBlockForLabel(T.first);
+        auto reaches = [&](uint64_t Offset, int64_t Addend = 0) {
+          const uint64_t Delta = Offset + uint64_t(Addend) - Offsets[&Inst];
+          return !(Delta & 3) &&
+                 isIntN(BC.MIB->getPCRelEncodingSize(Inst), Delta);
+        };
+        if (TargetBB && PreserveLayout && !T.second)
+          continue;
+        if (!Redirects.count(&Inst) && !Swaps.count(&Inst) && TargetBB &&
+            TargetBB->getFragmentNum() == FF.getFragmentNum() &&
+            reaches(Blocks.lookup(TargetBB), T.second))
+          continue;
+        if (const MCInst *Via = Redirects.lookup(&Inst)) {
+          if (actualTarget(Via) == T && reaches(trampolineOffset(Via)))
             continue;
-
-          // Preserve the original hot fall-through for proven zero-count
-          // taken edges. Non-simple functions may only grow at their end.
-          // Patches have a fixed footprint: no append-only trampoline space.
-          // A fall-through continuation after the thunk area still needs the
-          // fragment-end CFI row. Without a row interpreter, only outline in
-          // that case when the source and end epochs already agree.
-          if (!BF.isPatch() && !HasCFIStack && (C.Cold || PreserveLayout) &&
-              (!MayFallThrough || !NeedsFDE || CFIEpoch == S.CFIEpoch)) {
-            auto &Group = Outlined[{C.Target, S.CFIEpoch}];
-            for (unsigned I : Group) {
-              if (!C.Target.first)
-                break;
-              if (reaches(thunkOffset(I))) {
-                C.Form = Outline;
-                C.Via = I;
-                break;
-              }
-            }
-            const auto Insertion = llvm::lower_bound(
-                ThunkOrder, C.SiteIndex, [&](unsigned I, unsigned Source) {
-                  return Thunks[I].Source > Source;
-                });
-            const uint64_t Offset = CodeSize + (MayFallThrough ? 4 : 0) +
-                                    4 * (Insertion - ThunkOrder.begin());
-            if (C.Form != Outline && reaches(Offset)) {
-              C.Form = Outline;
-              C.Via = Thunks.size();
-              Thunks.push_back({C.SiteIndex, Offset, true});
-              NewThunkSources.push_back(C.SiteIndex);
-              Group.push_back(C.Via);
-              // Recompute exact reverse-source ordering before validating.
-            }
-            if (C.Form == Outline) {
+        } else if (const MCInst *Near = Swaps.lookup(&Inst)) {
+          const Target N = target(*Near);
+          const auto *NearBB = BF.getBasicBlockForLabel(N.first);
+          if (NearBB && Blocks.count(NearBB) &&
+              reaches(Blocks.lookup(NearBB), N.second))
+            continue;
+        } else {
+          // Reuse a reachable B first, with identical unwind state.
+          const Key K{T, CFI.lookup(&Inst)};
+          const MCInst *B = FragmentTrampolines.lookup(K);
+          if (!B)
+            B = SymbolTrampolines.lookup(K);
+          if (B) {
+            if (actualTarget(B) == T && reaches(trampolineOffset(B))) {
+              Redirects[&Inst] = B;
               Changed = true;
               continue;
             }
           }
-
-          // B.cond far; B near -> B.!cond near; B far. Both original PCs and
-          // all instruction-address/CFI labels stay in place. Unlike ordinary
-          // inline expansion this does not add a second B on the not-taken
-          // path.
-          if (!PreserveLayout && C.Reversible && C.Pair != Invalid) {
-            const Destination Near = destination(*Sites[C.Pair].Inst);
-            auto It = BlockIndices.find(BF.getBasicBlockForLabel(Near.first));
-            if (It != BlockIndices.end() &&
-                reaches(Blocks[It->second].Offset, Near.second)) {
-              C.Form = Swap;
+          // Then outline a cold taken edge, retaining hot fall-through.
+          const bool Cold = BF.hasValidProfile() && BB->hasProfile() &&
+                            !T.second && TargetBB &&
+                            BB->getSuccessor(T.first) == TargetBB &&
+                            BB->getBranchInfo(*TargetBB).Count == 0;
+          if (!BF.isPatch() && (Cold || PreserveLayout) && !OpaqueCFI &&
+              (!HasCFI || !FallThrough || CFI.lookup(&Inst) == Epoch)) {
+            const MCInst *B = T.first ? SymbolTrampolines.lookup(K) : nullptr;
+            if (reaches(B ? trampolineOffset(B) : endOffset(&Inst))) {
+              if (!B) {
+                B = &Inst;
+                Trampolines.push_back(B);
+                Outlined.insert(B);
+                if (T.first)
+                  SymbolTrampolines[K] = B;
+              }
+              Redirects[&Inst] = B;
+              Changed = true;
+              continue;
+            }
+          }
+          // B.cond far; B near can use a short inversion without growth.
+          const auto I = BB->begin() + (&Inst - &*BB->begin());
+          const auto Next =
+              std::find_if(std::next(I), BB->end(), [&](const MCInst &M) {
+                return !BC.MIB->isPseudo(M);
+              });
+          if (!PreserveLayout && BC.MIB->isReversibleBranch(Inst) &&
+              Next != BB->end() && CFI.lookup(&*Next) == CFI.lookup(&Inst) &&
+              BC.MII->get(Next->getOpcode()).isUnconditionalBranch()) {
+            const Target N = target(*Next);
+            const auto *NearBB = BF.getBasicBlockForLabel(N.first);
+            if (NearBB && Blocks.count(NearBB) &&
+                reaches(Blocks.lookup(NearBB), N.second)) {
+              Swaps[&Inst] = &*Next;
+              SwapJumps[&*Next] = &Inst;
               Changed = true;
               continue;
             }
           }
         }
         if (PreserveLayout) {
-          ErrorInst = S.Inst;
-          ErrorMessage =
-              BF.isPatch()
-                  ? "fixed-size patch cannot grow for local branch relaxation"
-              : HasCFIStack ||
-                      (MayFallThrough && NeedsFDE && CFIEpoch != S.CFIEpoch)
-                  ? "cannot preserve unwind state for end-of-function "
-                    "trampoline"
-                  : "end-of-function trampoline is out of reach";
+          Error = &Inst;
           return;
         }
-        // Monotonic fallback: every failed reuse/outline/swap becomes inline.
-        C.Form = Inline;
-        Blocks[S.BlockIndex].Growth += extraSize(C);
+        Redirects.erase(&Inst);
+        if (const MCInst *B = Swaps.lookup(&Inst))
+          SwapJumps.erase(B);
+        Swaps.erase(&Inst);
+        Inline.insert(&Inst);
+        LayoutChanged = true;
+        if (T.first && !Outlined.contains(&Inst))
+          FragmentTrampolines.try_emplace(Key{T, CFI.lookup(&Inst)}, &Inst);
         Changed = true;
       }
     } while (Changed);
-
-    for (const Candidate &C : Candidates) {
-      const MCInst *Inst = Sites[C.SiteIndex].Inst;
-      switch (C.Form) {
-      case Direct:
-        break;
-      case Inline:
-        Actions[Inst] = {Inline};
-        break;
-      case Swap:
-        Actions[Inst] = {Swap, Sites[C.Pair].Inst};
-        Actions[Sites[C.Pair].Inst] = {Direct, Inst};
-        break;
-      case Reuse:
-        ReusedBranches.push_back(Sites[C.Via].Inst);
-        Actions[Inst] = {Reuse, Sites[C.Via].Inst};
-        break;
-      case Outline:
-        Actions[Inst] = {Outline, Sites[Thunks[C.Via].Source].Inst};
-        break;
-      }
-    }
-    // Source order is also the order of CFI remember_state pushes. Emit
-    // trampolines in reverse order so restore_state pops the right snapshot.
-    for (unsigned I : llvm::reverse(ThunkOrder))
-      Trampolines.push_back(
-          {Sites[Thunks[I].Source].Inst, Sites[Thunks[I].Source].ArgsSize});
-    NeedsGuard = !Trampolines.empty() && MayFallThrough;
+    llvm::sort(Trampolines, [&](const MCInst *A, const MCInst *B) {
+      return Offsets.lookup(A) < Offsets.lookup(B);
+    });
+    Guard = !Trampolines.empty() && fragmentMayFallThrough(FF, BC);
+    DenseSet<const MCInst *> Needed(Trampolines.begin(), Trampolines.end());
+    for (const auto &[Inst, Via] : Redirects)
+      Needed.insert(Via);
+    LabelOrder.append(Needed.begin(), Needed.end());
+    llvm::sort(LabelOrder, [&](const MCInst *A, const MCInst *B) {
+      return Offsets.lookup(A) < Offsets.lookup(B);
+    });
   }
 
-  bool prepareForEmission(const BinaryFunction &BF) {
-    if (ErrorInst) {
-      BC.Ctx->reportError(ErrorInst->getLoc(),
-                          Twine("cannot relax branch in function ") +
-                              BF.getPrintName() + ": " + ErrorMessage);
+  bool prepare(const BinaryFunction &BF) {
+    if (Error) {
+      BC.Ctx->reportError(
+          Error->getLoc(),
+          Twine("cannot relax branch in function ") + BF.getPrintName() +
+              (BF.isPatch() ? ": fixed-size patch cannot grow for local branch "
+                              "relaxation"
+                            : ": end-of-function trampoline is out of reach"));
       return false;
     }
-    for (const MCInst *Inst : ReusedBranches)
-      if (!Labels.count(Inst)) {
-        Labels[Inst] = BC.Ctx->createTempSymbol("local_reused_branch");
-        ReusedLabels[Inst] = Labels.lookup(Inst);
-      }
-    for (const EmittedTrampoline &T : Trampolines) {
-      Labels[T.Source] = BC.Ctx->createTempSymbol("local_trampoline");
-      if (NeedsFDE)
-        SavedCFI[T.Source] = 1;
-    }
-    for (auto &[Inst, A] : Actions)
-      if (A.Form == Reuse || A.Form == Outline)
-        A.Label = Labels.lookup(A.TargetInst);
-    if (NeedsGuard)
-      TrampolinesEnd = BC.Ctx->createTempSymbol("local_trampolines_end");
+    // Materialize labels in emission order, never in the worker threads.
+    for (const MCInst *Inst : LabelOrder)
+      Labels[Inst] = BC.Ctx->createTempSymbol("local_trampoline");
+    for (const auto &[Inst, Via] : Redirects)
+      if (!Outlined.contains(Via))
+        ReusedLabels[Via] = Labels.lookup(Via);
+    if (Guard)
+      End = BC.Ctx->createTempSymbol("local_trampolines_end");
     return true;
   }
 
-  void emitBefore(const MCInst &Inst, MCStreamer &Streamer) const {
-    // An outlined branch's snapshot is CFI only, with no code-size effect.
-    if (SavedCFI.count(&Inst))
-      Streamer.emitCFIRememberState(Inst.getLoc());
-    // Only reused B sites are instruction labels. An outlined source's label
-    // belongs at the end-of-fragment trampoline instead.
-    if (MCSymbol *Label = ReusedLabels.lookup(&Inst))
-      Streamer.emitLabel(Label);
+  void emitBefore(const MCInst &Inst, MCStreamer &S) const {
+    if (!Inline.contains(&Inst))
+      if (MCSymbol *Label = ReusedLabels.lookup(&Inst))
+        S.emitLabel(Label);
+    if (HasCFI && Outlined.contains(&Inst))
+      S.emitCFIRememberState(Inst.getLoc());
   }
 
-  bool emit(const MCInst &Inst, MCStreamer &Streamer) const {
-    auto It = Actions.find(&Inst);
-    if (It == Actions.end())
-      return false;
-    const Action &A = It->second;
-    if (A.Form == Direct) {
-      Streamer.emitInstruction(createJump(*A.TargetInst), *BC.STI);
-      return true;
-    }
-    if (A.Form == Swap) {
-      const MCInst &Near = *A.TargetInst;
-      for (MCInst Branch : BC.MIB->reverseBranchCondition(
-               Inst, BC.MIB->getTargetSymbol(Near), BC.Ctx.get())) {
-        Branch.getOperand(MCPlus::getNumPrimeOperands(Branch) - 1) =
-            Near.getOperand(0);
-        Streamer.emitInstruction(Branch, *BC.STI);
+  bool emit(const MCInst &Inst, MCStreamer &S) const {
+    if (const MCInst *Original = SwapJumps.lookup(&Inst)) {
+      S.emitInstruction(jump(*Original), *BC.STI);
+    } else if (const MCInst *Near = Swaps.lookup(&Inst)) {
+      MCInst B = BC.MIB
+                     ->reverseBranchCondition(
+                         Inst, BC.MIB->getTargetSymbol(*Near), BC.Ctx.get())
+                     .front();
+      B.getOperand(MCPlus::getNumPrimeOperands(B) - 1) = Near->getOperand(0);
+      S.emitInstruction(B, *BC.STI);
+    } else if (const MCInst *Via = Redirects.lookup(&Inst)) {
+      MCInst B = Inst;
+      BC.MIB->replaceBranchTarget(B, Labels.lookup(Via), BC.Ctx.get());
+      S.emitInstruction(B, *BC.STI);
+    } else if (Inline.contains(&Inst)) {
+      MCSymbol *Next = BC.Ctx->createTempSymbol("local_branch_end");
+      if (BC.MIB->isReversibleBranch(Inst)) {
+        for (const MCInst &B :
+             BC.MIB->reverseBranchCondition(Inst, Next, BC.Ctx.get()))
+          S.emitInstruction(B, *BC.STI);
+      } else {
+        MCSymbol *Taken = BC.Ctx->createTempSymbol("local_branch_taken");
+        MCInst B = Inst;
+        BC.MIB->replaceBranchTarget(B, Taken, BC.Ctx.get());
+        S.emitInstruction(B, *BC.STI);
+        BC.MIB->createUncondBranch(B, Next, BC.Ctx.get());
+        S.emitInstruction(B, *BC.STI);
+        S.emitLabel(Taken);
       }
-      return true;
-    }
-    if (A.Form == Reuse || A.Form == Outline) {
-      MCInst Branch = Inst;
-      BC.MIB->replaceBranchTarget(Branch, A.Label, BC.Ctx.get());
-      Streamer.emitInstruction(Branch, *BC.STI);
-      return true;
-    }
-
-    MCSymbol *End = BC.Ctx->createTempSymbol("local_branch_end");
-    if (BC.MIB->isReversibleBranch(Inst)) {
-      // Preserve flags: liveness analysis is no longer valid after lowering.
-      for (const MCInst &Branch :
-           BC.MIB->reverseBranchCondition(Inst, End, BC.Ctx.get()))
-        Streamer.emitInstruction(Branch, *BC.STI);
+      if (MCSymbol *Label = ReusedLabels.lookup(&Inst))
+        S.emitLabel(Label);
+      S.emitInstruction(jump(Inst), *BC.STI);
+      S.emitLabel(Next);
     } else {
-      MCSymbol *Taken = BC.Ctx->createTempSymbol("local_branch_taken");
-      MCInst Branch = Inst;
-      BC.MIB->replaceBranchTarget(Branch, Taken, BC.Ctx.get());
-      Streamer.emitInstruction(Branch, *BC.STI);
-      BC.MIB->createUncondBranch(Branch, End, BC.Ctx.get());
-      Streamer.emitInstruction(Branch, *BC.STI);
-      Streamer.emitLabel(Taken);
+      return false;
     }
-    Streamer.emitInstruction(createJump(Inst), *BC.STI);
-    Streamer.emitLabel(End);
     return true;
   }
 
-  void emitTrampolines(MCStreamer &Streamer) const {
-    if (TrampolinesEnd) {
-      MCInst Jump;
-      BC.MIB->createUncondBranch(Jump, TrampolinesEnd, BC.Ctx.get());
-      Streamer.emitInstruction(Jump, *BC.STI);
+  void emitTrampolines(MCStreamer &S) const {
+    if (End) {
+      MCInst B;
+      BC.MIB->createUncondBranch(B, End, BC.Ctx.get());
+      S.emitInstruction(B, *BC.STI);
     }
-    for (const EmittedTrampoline &T : llvm::reverse(Trampolines)) {
-      if (NeedsFDE)
-        Streamer.emitCFIRestoreState(T.Source->getLoc());
-      // GNU_args_size is not part of the register row saved by
-      // DW_CFA_remember_state.
-      if (NeedsFDE && NeedsArgsSize)
-        Streamer.emitCFIGnuArgsSize(T.ArgsSize);
-      Streamer.emitLabel(Labels.lookup(T.Source));
-      Streamer.emitInstruction(createJump(*T.Source), *BC.STI);
+    for (const MCInst *Source : llvm::reverse(Trampolines)) {
+      if (HasCFI) {
+        S.emitCFIRestoreState(Source->getLoc());
+        if (HasArgs)
+          S.emitCFIGnuArgsSize(ArgsSizes.lookup(Source));
+      }
+      S.emitLabel(Labels.lookup(Source));
+      S.emitInstruction(jump(*Source), *BC.STI);
     }
-    if (TrampolinesEnd)
-      Streamer.emitLabel(TrampolinesEnd);
+    if (End)
+      S.emitLabel(End);
   }
 };
-
-bool shouldEmitFunction(const BinaryFunction &BF, const BinaryContext &BC) {
-  return BC.shouldEmit(BF) && (BF.size() || BF.hasIslandsInfo()) &&
-         BF.getState() != BinaryFunction::State::Empty &&
-         (BC.HasRelocations || BF.hasNonPseudoInstructions());
-}
-
-bool breakFunction(const BinaryFunction &BF) {
-  return llvm::any_of(opts::BreakFunctionNames, [&](const std::string &Name) {
-    return BF.hasNameRegex(Name);
-  });
-}
-
-} // namespace
-
-struct BinaryEmissionPlan::Impl {
-  struct Fragment {
-    BinaryFunction *BF;
-    FunctionFragment *FF;
-    uint64_t PrefixSize;
-    bool Break;
-    std::unique_ptr<LocalBranchRelaxation> Relaxation;
-  };
-  SmallVector<Fragment, 0> Fragments;
-  size_t NextFragment = 0;
-};
-
-BinaryEmissionPlan::BinaryEmissionPlan(BinaryContext &BC) {
-  if (!useFragmentSections(BC) || !BC.HasRelocations)
-    return;
-  State = std::make_unique<Impl>();
-  uint64_t TotalCost = 0;
-  SmallVector<uint64_t, 0> Costs;
-  // Use the emitter's output order and predicates. OutputFunctions already
-  // includes injected functions, unlike runOnEachFunction's input-address map.
-  for (BinaryFunction *BF : BC.getOutputBinaryFunctions()) {
-    if (!shouldEmitFunction(*BF, BC))
-      continue;
-    // This serial preparation creates MC symbols and rewrites island operands.
-    // Finish it before workers read the final instructions of any fragment.
-    if (BF->isSplit() && BF->hasConstantIsland()) {
-      assert(BF->getLayout().isHotColdSplit() &&
-             "Constant island support only with hot/cold split");
-      BF->duplicateConstantIslands();
-    }
-    const uint64_t Prefix = opts::padFunctionBefore(*BF);
-    const bool Break = breakFunction(*BF);
-    for (FunctionFragment &FF : BF->getLayout().fragments()) {
-      if (FF.isSplitFragment() && FF.empty() && !BF->hasConstantIsland())
-        continue;
-      State->Fragments.push_back({BF, &FF, Prefix, Break,
-                                  std::make_unique<LocalBranchRelaxation>(BC)});
-      uint64_t Cost = 1;
-      for (const BinaryBasicBlock *BB : FF)
-        Cost += BB->size();
-      Costs.push_back(Cost);
-      TotalCost += Cost;
-    }
-  }
-  auto Work = [&](size_t Begin, size_t End) {
-    for (size_t I = Begin; I != End; ++I) {
-      Impl::Fragment &F = State->Fragments[I];
-      F.Relaxation->run(*F.BF, *F.FF, F.PrefixSize + (F.Break ? 2 : 0));
-    }
-  };
-  // Bound scheduler overhead for small fragments and honor BOLT's thread and
-  // task options. Jobs own disjoint plans and only read the finalized input.
-  if (opts::NoThreads || opts::ThreadCount == 1 || TotalCost < 32768) {
-    Work(0, State->Fragments.size());
-    return;
-  }
-  const uint64_t Jobs =
-      std::max<uint64_t>(1, uint64_t(opts::ThreadCount) * opts::TaskCount);
-  const uint64_t BatchCost = std::max<uint64_t>(32768, TotalCost / Jobs);
-  ThreadPoolInterface &Pool = ParallelUtilities::getThreadPool();
-  size_t Begin = 0;
-  uint64_t Cost = 0;
-  for (size_t I = 0; I != Costs.size(); ++I) {
-    Cost += Costs[I];
-    if (Cost >= BatchCost) {
-      Pool.async(Work, Begin, I + 1);
-      Begin = I + 1;
-      Cost = 0;
-    }
-  }
-  if (Begin != Costs.size())
-    Pool.async(Work, Begin, Costs.size());
-  Pool.wait();
-}
-
-BinaryEmissionPlan::~BinaryEmissionPlan() = default;
-
-namespace {
 
 class BinaryEmitter {
 private:
@@ -775,12 +476,16 @@ private:
 
   MCStreamer &Streamer;
   BinaryContext &BC;
-  BinaryEmissionPlan::Impl *Plan;
+  bool RelaxBranches;
+  DenseMap<const FunctionFragment *, std::unique_ptr<LocalBranchRelaxation>>
+      Relaxations;
+
+  void relaxLocalBranches();
 
 public:
   BinaryEmitter(MCStreamer &Streamer, BinaryContext &BC,
-                BinaryEmissionPlan::Impl *Plan = nullptr)
-      : Streamer(Streamer), BC(BC), Plan(Plan) {}
+                bool RelaxBranches = false)
+      : Streamer(Streamer), BC(BC), RelaxBranches(RelaxBranches) {}
 
   /// Emit all code and data.
   void emitAll(StringRef OrgSecPrefix);
@@ -884,6 +589,8 @@ void BinaryEmitter::emitAll(StringRef OrgSecPrefix) {
 
   BC.getTextSection()->setAlignment(Align(BC.AlignText));
 
+  if (RelaxBranches)
+    relaxLocalBranches();
   emitFunctions();
 
   if (opts::UpdateDebugSections) {
@@ -897,6 +604,41 @@ void BinaryEmitter::emitAll(StringRef OrgSecPrefix) {
   if (BC.isELF())
     AddressMap::emit(Streamer, BC);
   Streamer.setUseAssemblerInfoForParsing(true);
+}
+
+void BinaryEmitter::relaxLocalBranches() {
+  DenseMap<const BinaryFunction *, uint64_t> BodyOffsets;
+  for (BinaryFunction *BF : BC.getOutputBinaryFunctions()) {
+    if (!BC.shouldEmit(*BF) || (BF->empty() && !BF->hasIslandsInfo()) ||
+        BF->getState() == BinaryFunction::State::Empty)
+      continue;
+    uint64_t Offset = opts::padFunctionBefore(*BF);
+    for (const std::string &Name : opts::BreakFunctionNames)
+      if (BF->hasNameRegex(Name)) {
+        Offset += 2;
+        break;
+      }
+    BodyOffsets[BF] = Offset;
+    if (BF->isSplit() && BF->hasConstantIsland())
+      BF->duplicateConstantIslands();
+    for (FunctionFragment &FF : BF->getLayout().fragments())
+      if (!FF.isSplitFragment() || !FF.empty() || BF->hasConstantIsland())
+        Relaxations[&FF] = std::make_unique<LocalBranchRelaxation>(BC);
+  }
+  const auto &Plans = Relaxations;
+  const auto &Offsets = BodyOffsets;
+  auto Relax = [&](BinaryFunction &BF) {
+    for (FunctionFragment &FF : BF.getLayout().fragments())
+      if (auto I = Plans.find(&FF); I != Plans.end())
+        I->second->run(BF, FF, Offsets.lookup(&BF));
+  };
+  ParallelUtilities::runOnEachFunction(
+      BC, ParallelUtilities::SP_INST_LINEAR, Relax,
+      [&](const BinaryFunction &BF) { return !Offsets.count(&BF); },
+      "RelaxLocalBranches");
+  for (BinaryFunction *BF : BC.getInjectedBinaryFunctions())
+    if (Offsets.count(BF))
+      Relax(*BF);
 }
 
 void BinaryEmitter::emitFunctions() {
@@ -974,18 +716,21 @@ void BinaryEmitter::emitFunctions() {
 
 bool BinaryEmitter::emitFunction(BinaryFunction &Function,
                                  FunctionFragment &FF) {
-  // Avoid emitting function without instructions when overwriting the original
-  // function in-place. Otherwise, emit the empty function to define the symbol.
-  if (!shouldEmitFunction(Function, BC))
+  if (Function.size() == 0 && !Function.hasIslandsInfo())
     return false;
 
-  BinaryEmissionPlan::Impl::Fragment *Planned = nullptr;
-  if (Plan) {
-    assert(Plan->NextFragment < Plan->Fragments.size());
-    Planned = &Plan->Fragments[Plan->NextFragment++];
-    assert(Planned->BF == &Function && Planned->FF == &FF &&
-           "planning and emission orders differ");
-    if (!Planned->Relaxation->prepareForEmission(Function))
+  if (Function.getState() == BinaryFunction::State::Empty)
+    return false;
+
+  // Avoid emitting function without instructions when overwriting the original
+  // function in-place. Otherwise, emit the empty function to define the symbol.
+  if (!BC.HasRelocations && !Function.hasNonPseudoInstructions())
+    return false;
+
+  LocalBranchRelaxation *Relaxation = nullptr;
+  if (auto I = Relaxations.find(&FF); I != Relaxations.end()) {
+    Relaxation = I->second.get();
+    if (!Relaxation->prepare(Function))
       return false;
   }
 
@@ -995,8 +740,7 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   const uint16_t MaxAlignBytes = FF.isSplitFragment()
                                      ? Function.getMaxColdAlignmentBytes()
                                      : Function.getMaxAlignmentBytes();
-  const size_t PrefixSize =
-      Planned ? Planned->PrefixSize : opts::padFunctionBefore(Function);
+  const size_t PrefixSize = opts::padFunctionBefore(Function);
   const bool HasFallThrough =
       FragmentSections && !Function.isPatch() && fragmentMayFallThrough(FF, BC);
   if (FragmentSections) {
@@ -1101,16 +845,18 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
          "first basic block should never be cold");
 
   // Emit UD2 at the beginning if requested by user.
-  if (Planned ? Planned->Break : breakFunction(Function))
-    Streamer.emitIntValue(0x0B0F, 2); // UD2: 0F 0B
+  if (!opts::BreakFunctionNames.empty()) {
+    for (std::string &Name : opts::BreakFunctionNames) {
+      if (Function.hasNameRegex(Name)) {
+        Streamer.emitIntValue(0x0B0F, 2); // UD2: 0F 0B
+        break;
+      }
+    }
+  }
 
   // Emit code.
-  emitFunctionBody(Function, FF, /*EmitCodeOnly=*/false,
-                   Planned ? Planned->Relaxation.get() : nullptr);
-  // The CFG will be released after the last fragment. Release references to
-  // its instructions and plan storage as soon as this fragment is emitted.
-  if (Planned)
-    Planned->Relaxation.reset();
+  emitFunctionBody(Function, FF, /*EmitCodeOnly=*/false, Relaxation);
+  Relaxations.erase(&FF);
 
   // Emit padding if requested.
   if (size_t Padding = opts::padFunctionAfter(Function)) {
@@ -1163,9 +909,6 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
                                      bool EmitCodeOnly,
                                      LocalBranchRelaxation *Relaxation) {
-  // Size estimation and callers outside emitAndLink never plan relaxation.
-  const bool RelaxBranches = Relaxation != nullptr;
-
   if (!EmitCodeOnly && !Relaxation && FF.isSplitFragment() &&
       BF.hasConstantIsland()) {
     assert(BF.getLayout().isHotColdSplit() &&
@@ -1236,24 +979,22 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         }
       }
 
-      if (RelaxBranches)
+      bool Relaxed = false;
+      if (Relaxation && BC.MII->get(Instr.getOpcode()).isBranch()) {
         Relaxation->emitBefore(Instr, Streamer);
-      if (!RelaxBranches || !Relaxation->emit(Instr, Streamer))
+        Relaxed = Relaxation->emit(Instr, Streamer);
+      }
+      if (!Relaxed)
         Streamer.emitInstruction(Instr, *BC.STI);
-
-      // A range ending at this instruction must stop before a synthetic branch
-      // or a reordered successor. In particular, call-clobbered locations are
-      // no longer valid at the B inserted after a call by fixBranches().
-      if (RelaxBranches && opts::UpdateDebugSections)
+      if (useFragmentSections(BC) && !EmitCodeOnly && opts::UpdateDebugSections)
         if (std::optional<uint32_t> Offset = BC.MIB->getOffset(Instr))
           AddressMap::emitInstructionEnd(Streamer, BC,
                                          BF.getAddress() + *Offset + 4);
     }
   }
 
-  if (RelaxBranches)
+  if (Relaxation)
     Relaxation->emitTrampolines(Streamer);
-
   if (!EmitCodeOnly)
     emitConstantIslands(BF, FF.isSplitFragment());
 }
@@ -1975,11 +1716,9 @@ void emitBinaryContext(MCStreamer &Streamer, BinaryContext &BC,
 }
 
 void emitBinaryContext(MCStreamer &Streamer, BinaryContext &BC,
-                       StringRef OrgSecPrefix, BinaryEmissionPlan &Plan) {
-  BinaryEmitter(Streamer, BC, Plan.State.get()).emitAll(OrgSecPrefix);
-  assert((!Plan.State ||
-          Plan.State->NextFragment == Plan.State->Fragments.size()) &&
-         "not all planned fragments were emitted");
+                       StringRef OrgSecPrefix, bool RelaxBranches) {
+  BinaryEmitter(Streamer, BC, RelaxBranches && useFragmentSections(BC))
+      .emitAll(OrgSecPrefix);
 }
 
 void emitFunctionBody(MCStreamer &Streamer, BinaryFunction &BF,

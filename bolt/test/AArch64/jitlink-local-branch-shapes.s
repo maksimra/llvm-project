@@ -76,6 +76,23 @@
 # LIMIT: {{0*}}[[#LIMIT + 1024]]: b {{.*}} <callee2>
 # LIMIT-NEXT: {{0*}}[[#LIMIT + 1028]]: b {{.*}} <callee1>
 
+## Like LongJmp, reuse a B introduced by an earlier inline relaxation too.
+# RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux -mattr=+cmpbr \
+# RUN:   %t/inline-reuse.s -o %t.inline.o
+# RUN: ld.lld --emit-relocs -e inline_reuse %t.inline.o -o %t.inline
+# RUN: llvm-bolt %t.inline -o %t.inline.bolt --turn-off-stubs --lite=0 \
+# RUN:   --keep-nops --reorder-blocks=reverse
+# RUN: llvm-objdump -d --no-show-raw-insn --mattr=+cmpbr \
+# RUN:   --disassemble-symbols=inline_reuse %t.inline.bolt | FileCheck %s --check-prefix=INLINE
+# INLINE-LABEL: <inline_reuse>:
+# INLINE-NEXT: cmp x2, #0x0
+# INLINE-NEXT: cbgt x0, #0x3f, 0x[[#%x,TAKEN:]]
+# INLINE-NEXT: b 0x[[#%x,END:]]
+# INLINE-NEXT: {{0*}}[[#TAKEN]]: b
+# INLINE-NEXT: {{0*}}[[#END]]: b
+# INLINE-NEXT: ret
+# INLINE-NEXT: tbz w1, #0x0, 0x[[#TAKEN]]
+
 #--- reuse.s
 .text
 .globl reuse
@@ -192,4 +209,26 @@ cold:
   ret
 .cfi_endproc
 .size cold, .-cold
+.reloc 0, R_AARCH64_NONE
+
+#--- inline-reuse.s
+.text
+.globl inline_reuse
+.type inline_reuse, %function
+inline_reuse:
+  cmp x2, #0
+  cbgt x0, #63, .Lfar
+  b .Lpadding
+.Lfar:
+  csel x0, x0, x1, eq
+  cbz x3, .Llast
+  ret
+.Lpadding:
+  .rept 8189
+  nop
+  .endr
+.Llast:
+  tbz w1, #0, .Lfar
+  ret
+.size inline_reuse, .-inline_reuse
 .reloc 0, R_AARCH64_NONE

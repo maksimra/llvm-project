@@ -4321,17 +4321,8 @@ void RewriteInstance::emitAndLink() {
     }
   }
 
-  // Gather exactly the fragments that will be emitted (including injected
-  // functions in the output list). All local relaxation happens here, after
-  // optimization and instruction/CFI lowering, with no MC mutations in workers.
-  std::unique_ptr<BinaryEmissionPlan> EmissionPlan;
-  {
-    NamedRegionTimer PlanTimer("localBranchRelaxation", "plan local branches",
-                               "bolt-local-branches",
-                               "BOLT local branch relaxation", opts::TimeRewrite);
-    EmissionPlan = std::make_unique<BinaryEmissionPlan>(*BC);
-  }
-  emitBinaryContext(*Streamer, *BC, getOrgSecPrefix(), *EmissionPlan);
+  emitBinaryContext(*Streamer, *BC, getOrgSecPrefix(),
+                     opts::DoNotUseStubs && BC->isAArch64());
 
   Streamer->finish();
   if (Streamer->getContext().hadError()) {
