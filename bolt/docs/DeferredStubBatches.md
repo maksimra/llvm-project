@@ -95,7 +95,11 @@ Unlike global `LongJmpPass` relaxation, there is no estimated function layout,
 cluster graph, branch-chain insertion or iterative convergence for global
 branches. With `--turn-off-stubs`, `LongJmpPass` only prepares BTI destinations.
 `emitFunctionBody` relaxes local conditional branches after all passes, using
-the final instructions and conservative bounds for block alignment padding.
+the final instructions and exact section-relative block alignment padding.
+The layout includes any bytes before the body, such as `--pad-funcs-before`,
+and applies MC's alignment budget: excessive padding is skipped, while a zero
+budget permits unrestricted alignment. MC records the required alignment on
+each private section, and JITLink preserves it when placing the whole fragment.
 It iterates a per-fragment expansion plan until all short branches fit. Branches
 between fragments are expanded to unconditional B relocations for JITLink.
 

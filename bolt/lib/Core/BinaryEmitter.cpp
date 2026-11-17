@@ -156,7 +156,8 @@ class LocalBranchRelaxation {
 public:
   explicit LocalBranchRelaxation(BinaryContext &BC) : BC(BC) {}
 
-  bool run(const BinaryFunction &BF, const FunctionFragment &FF) {
+  bool run(const BinaryFunction &BF, const FunctionFragment &FF,
+           uint64_t BodyOffset) {
     const bool PreserveLayout = !BF.isSimple() || BF.isPatch();
     DenseMap<const BinaryBasicBlock *, uint64_t> BlockOffsets;
     DenseMap<const MCInst *, uint64_t> BranchOffsets;
@@ -165,17 +166,19 @@ public:
     uint64_t CodeSize;
     bool Changed;
     do {
-      // Budget the maximum padding at each block. Distances then bound the
-      // actual displacement independently of the fragment's final address.
-      CodeSize = 0;
+      // Each fragment has a private MC section whose alignment preserves all
+      // block alignments when JITLink moves it. Compute the same
+      // section-relative layout as MC, including the bytes preceding the body.
+      CodeSize = BodyOffset;
       for (const BinaryBasicBlock *BB : FF) {
         if ((BC.AlignBlocks || BC.PreserveBlocksAlignment) &&
             BB->getAlignment() > 1) {
-          const uint64_t MaxPadding = BB->getAlignment() - 1;
-          CodeSize +=
-              BB->getAlignmentMaxBytes()
-                  ? std::min<uint64_t>(MaxPadding, BB->getAlignmentMaxBytes())
-                  : MaxPadding;
+          const uint64_t Padding = offsetToAlignment(CodeSize, BB->getAlign());
+          const uint32_t MaxBytes = BB->getAlignmentMaxBytes();
+          // MC skips alignment entirely when the required padding exceeds the
+          // budget. A zero budget means unlimited padding.
+          if (!MaxBytes || Padding <= MaxBytes)
+            CodeSize += Padding;
         }
         BlockOffsets[BB] = CodeSize;
         for (const MCInst &Inst : *BB) {
@@ -313,8 +316,10 @@ public:
 
   /// Emit function code. The caller is responsible for emitting function
   /// symbol(s) and setting the section to emit the code to.
+  /// BodyOffset is the body's offset in a private fragment section, used by
+  /// final branch relaxation.
   void emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
-                        bool EmitCodeOnly = false);
+                        bool EmitCodeOnly = false, uint64_t BodyOffset = 0);
 
 private:
   /// Emit function code.
@@ -620,18 +625,22 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   assert((Function.empty() || !(*Function.begin()).isCold()) &&
          "first basic block should never be cold");
 
+  // Track the body's section offset for deferred branch relaxation. The
+  // private section's initial alignment adds no padding.
+  uint64_t BodyOffset = PrefixSize;
   // Emit UD2 at the beginning if requested by user.
   if (!opts::BreakFunctionNames.empty()) {
     for (std::string &Name : opts::BreakFunctionNames) {
       if (Function.hasNameRegex(Name)) {
         Streamer.emitIntValue(0x0B0F, 2); // UD2: 0F 0B
+        BodyOffset += 2;
         break;
       }
     }
   }
 
   // Emit code.
-  emitFunctionBody(Function, FF, /*EmitCodeOnly=*/false);
+  emitFunctionBody(Function, FF, /*EmitCodeOnly=*/false, BodyOffset);
 
   // Emit padding if requested.
   if (size_t Padding = opts::padFunctionAfter(Function)) {
@@ -682,11 +691,11 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 }
 
 void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
-                                     bool EmitCodeOnly) {
+                                     bool EmitCodeOnly, uint64_t BodyOffset) {
   LocalBranchRelaxation Relaxation(BC);
   // Size-estimation emission runs during optimization and must not relax code.
   const bool RelaxBranches = useFragmentSections(BC) && !EmitCodeOnly;
-  if (RelaxBranches && !Relaxation.run(BF, FF))
+  if (RelaxBranches && !Relaxation.run(BF, FF, BodyOffset))
     return;
 
   if (!EmitCodeOnly && FF.isSplitFragment() && BF.hasConstantIsland()) {
