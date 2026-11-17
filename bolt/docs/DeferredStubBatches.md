@@ -94,22 +94,46 @@ it is not a general query for section contents at any graph stage.
 Unlike global `LongJmpPass` relaxation, there is no estimated function layout,
 cluster graph, branch-chain insertion or iterative convergence for global
 branches. With `--turn-off-stubs`, `LongJmpPass` only prepares BTI destinations.
-`emitFunctionBody` relaxes local conditional branches after all passes, using
-the final instructions and exact section-relative block alignment padding.
-The layout includes any bytes before the body, such as `--pad-funcs-before`,
-and applies MC's alignment budget: excessive padding is skipped, while a zero
-budget permits unrestricted alignment. MC records the required alignment on
-each private section, and JITLink preserves it when placing the whole fragment.
-It iterates a per-fragment expansion plan until all short branches fit. Branches
-between fragments are expanded to unconditional B relocations for JITLink.
+`RewriteInstance::emitAndLink()` constructs a `BinaryEmissionPlan` after all
+optimization, instruction lowering and CFI finalization. It collects the actual
+emission-order fragments from the output list, including injected functions,
+and finishes serial constant-island operand preparation before planning.
+Workers read immutable instructions, CFG edge counts and MC expressions; they
+never create MC symbols, evaluate variable expressions or access the streamer.
+Plans are applied in the original emission order. Symbol creation, CFI snapshot
+emission and all streamer operations stay on the emission thread.
 
-Expansion happens only in the MC streamer, without changing the finalized CFG
-or moving original instructions, CFI directives or instruction-address labels.
-Reversible branches use an inverted condition followed by B; irreversible
-branches use two local branches followed by B, preserving flags. Non-simple
-functions retain their internal layout and use end-of-function trampolines for
-external conditional branches, with a diagnostic if those are out of reach.
-Size-estimation emission during optimization does not run this relaxation.
+Each fragment is scanned once to collect block sizes, alignment constraints,
+conditional branches and reusable B sites. Cascading relaxation revisits only
+blocks and branch sites. A per-opcode fast path bounds all possible inline
+growth and BB padding; it excludes cross-fragment references and nonzero or
+unrecognized addends. Exact layout includes section prefixes and MC's alignment
+budget (zero means unlimited). JITLink preserves the private section alignment.
+The existing BOLT pool groups small fragments into jobs of at least 32768
+instructions and honors `--thread-count`, `--tasks-per-thread` and `--no-threads`.
+
+As in `LongJmpPass::relaxLocalBranches`, a far conditional first tries a reachable
+B with the same complete destination. Reuse conservatively requires no CFI
+change between the two sites. A confirmed zero-count taken edge can instead use
+a shared end-of-fragment trampoline, retaining the hot fall-through. These
+counts require a valid function profile and a matching CFG successor; lowered
+external tail calls and addends do not provide such evidence. A reversible
+`B.cond far; B near` pair becomes `B.!cond near; B far` when the near destination
+fits the short encoding. Otherwise expansion stays inline and preserves flags,
+including irreversible CMPBR predicates.
+
+Original instructions and their address/CFI labels are not moved. Outlined
+trampolines save the source CFI rows and restore them in reverse source order,
+including PAC state; GNU_args_size is emitted explicitly. Opaque CFI/CFI-stack
+operations disable outlining. A fall-through continuation also requires the
+source and fragment-end CFI epochs to agree. Non-simple functions keep their
+internal layout and use only reachable end trampolines for external branches.
+Fixed-size patches cannot append trampolines or acquire section-end guards;
+unrelaxable patch branches are diagnosed. Size-estimation emission never plans
+or applies local relaxation.
+
+See [the local-relaxation investigation](DeferredLocalBranchRelaxation.md) for
+commit comparison, measurements, validation and remaining production checks.
 
 With `--update-debug-sections`, emission also records instruction ends separately
 from instruction starts. An input boundary can be both a call's return PC and a

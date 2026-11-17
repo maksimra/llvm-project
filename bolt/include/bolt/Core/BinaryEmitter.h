@@ -15,6 +15,7 @@
 #define BOLT_CORE_BINARY_EMITTER_H
 
 #include "llvm/ADT/StringRef.h"
+#include <memory>
 
 namespace llvm {
 class MCStreamer;
@@ -24,6 +25,22 @@ class BinaryContext;
 class BinaryFunction;
 class FunctionFragment;
 
+/// Final, read-only fragment planning, used only by
+/// RewriteInstance::emitAndLink. Symbol creation and applying the plans are
+/// left to the emission thread.
+class BinaryEmissionPlan {
+public:
+  struct Impl;
+
+  explicit BinaryEmissionPlan(BinaryContext &BC);
+  ~BinaryEmissionPlan();
+
+private:
+  std::unique_ptr<Impl> State;
+  friend void emitBinaryContext(MCStreamer &, BinaryContext &, StringRef,
+                                BinaryEmissionPlan &);
+};
+
 /// Emit all code and data from the BinaryContext \p BC into the \p Streamer.
 ///
 /// \p OrgSecPrefix is used to modify name of emitted original sections
@@ -31,6 +48,9 @@ class FunctionFragment;
 /// by LLVM backend.
 void emitBinaryContext(MCStreamer &Streamer, BinaryContext &BC,
                        StringRef OrgSecPrefix = "");
+
+void emitBinaryContext(MCStreamer &Streamer, BinaryContext &BC,
+                       StringRef OrgSecPrefix, BinaryEmissionPlan &Plan);
 
 /// Emit \p BF function code. The caller is responsible for emitting function
 /// symbol(s) and setting the section to emit the code to.

@@ -22,11 +22,17 @@
 #endif // RISCV_AVAILABLE
 
 #include "bolt/Core/BinaryBasicBlock.h"
+#include "bolt/Core/BinaryEmitter.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Rewrite/RewriteInstance.h"
+#include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/MC/MCInstBuilder.h"
+#include "llvm/Object/ELFObjectFile.h"
+#include "llvm/Support/Endian.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "gtest/gtest.h"
@@ -130,6 +136,108 @@ protected:
 
 INSTANTIATE_TEST_SUITE_P(AArch64, MCPlusBuilderTester,
                          ::testing::Values(Triple::aarch64));
+
+TEST_P(MCPlusBuilderTester, DeferredInjectedBranchAddend) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const bool OldDeferred = opts::DoNotUseStubs;
+  scope_exit Restore([&] { opts::DoNotUseStubs = OldDeferred; });
+  opts::DoNotUseStubs = true;
+  BC->HasRelocations = true;
+  BC->AlignText = 4;
+  BinaryFunction *BF = BC->createInjectedBinaryFunction("injected", false);
+  BinaryBasicBlock *BB = BF->addBasicBlock();
+  MCSymbol *External = BC->Ctx->getOrCreateSymbol("external");
+  BB->addInstruction(
+      MCInstBuilder(AArch64::TBZW)
+          .addReg(AArch64::W0)
+          .addImm(0)
+          .addExpr(MCBinaryExpr::createSub(
+              MCBinaryExpr::createAdd(
+                  MCSymbolRefExpr::create(External, *BC->Ctx),
+                  MCConstantExpr::create(16, *BC->Ctx), *BC->Ctx),
+              MCConstantExpr::create(4, *BC->Ctx), *BC->Ctx)));
+  BB->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+  // Injected functions are absent from the input-address map used by
+  // runOnEachFunction, but must still have their fragments planned.
+  ASSERT_TRUE(BC->getBinaryFunctions().empty());
+  BinaryFunction *Patch = BC->createInjectedBinaryFunction("nop_patch");
+  Patch->setIsPatch(true);
+  Patch->setAnonymous(true);
+  Patch->addBasicBlock()->addInstruction(
+      MCInstBuilder(AArch64::HINT).addImm(0));
+  BC->updateOutputBinaryFunctions({BF, Patch});
+  SmallString<0> Buffer;
+  raw_svector_ostream OS(Buffer);
+  auto Streamer = BC->createStreamer(OS);
+  BinaryEmissionPlan Plan(*BC);
+  emitBinaryContext(*Streamer, *BC, "", Plan);
+  Streamer->finish();
+  ASSERT_FALSE(BC->Ctx->hadError());
+  auto Object = cantFail(ObjectFile::createObjectFile(
+      MemoryBufferRef(Buffer, "emitted fragment")));
+  bool Found = false;
+  bool FoundPatch = false;
+  bool FoundRelocation = false;
+  for (const SectionRef &Section : Object->sections()) {
+    if (cantFail(Section.getName()) == ".bolt.fragment.0") {
+      Found = true;
+      const StringRef Code = cantFail(Section.getContents());
+      ASSERT_EQ(Code.size(), 12u);
+      EXPECT_EQ(support::endian::read32le(Code.data()), 0x36000040u);
+    }
+    if (cantFail(Section.getName()) == ".bolt.fragment.1") {
+      FoundPatch = true;
+      // A fall-through patch must not acquire a synthetic section-end guard.
+      EXPECT_EQ(Section.getSize(), 4u);
+    }
+    for (const RelocationRef &Reloc : Section.relocations())
+      if (Reloc.getType() == ELF::R_AARCH64_JUMP26) {
+        FoundRelocation = true;
+        EXPECT_EQ(cantFail(ELFRelocationRef(Reloc).getAddend()), 12);
+        EXPECT_EQ(cantFail(Reloc.getSymbol()->getName()), "external");
+      }
+  }
+  EXPECT_TRUE(Found);
+  EXPECT_TRUE(FoundPatch);
+  EXPECT_TRUE(FoundRelocation);
+}
+
+TEST_P(MCPlusBuilderTester, DeferredPatchCannotGrow) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const bool OldDeferred = opts::DoNotUseStubs;
+  scope_exit Restore([&] { opts::DoNotUseStubs = OldDeferred; });
+  opts::DoNotUseStubs = true;
+  BC->HasRelocations = true;
+  BC->AlignText = 4;
+  BinaryFunction *BF = BC->createInjectedBinaryFunction("patch");
+  BF->setIsPatch(true);
+  BF->setAnonymous(true);
+  BinaryBasicBlock *BB = BF->addBasicBlock();
+  BB->addInstruction(
+      MCInstBuilder(AArch64::TBZW)
+          .addReg(AArch64::W0)
+          .addImm(0)
+          .addExpr(MCSymbolRefExpr::create(
+              BC->Ctx->getOrCreateSymbol("external"), *BC->Ctx)));
+  BB->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+  BC->updateOutputBinaryFunctions({BF});
+  SmallString<0> Buffer;
+  raw_svector_ostream OS(Buffer);
+  auto Streamer = BC->createStreamer(OS);
+  std::string Error;
+  scope_exit RestoreDiagnostics(
+      [&] { BC->Ctx->setDiagnosticHandler(nullptr); });
+  BC->Ctx->setDiagnosticHandler(
+      [&](const SMDiagnostic &D, bool, const SourceMgr &,
+          std::vector<const MDNode *> &) { Error = D.getMessage().str(); });
+  BinaryEmissionPlan Plan(*BC);
+  emitBinaryContext(*Streamer, *BC, "", Plan);
+  EXPECT_TRUE(BC->Ctx->hadError());
+  EXPECT_NE(Error.find("fixed-size patch cannot grow"), std::string::npos);
+  EXPECT_FALSE(BF->isEmitted());
+}
 
 TEST_P(MCPlusBuilderTester, AliasX0) {
   testRegAliases(Triple::aarch64, AArch64::X0,
