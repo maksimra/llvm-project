@@ -545,6 +545,7 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
     // Tighten branches according to offset differences between branch and
     // targets. No extra instructions after this pass, otherwise we may have
     // relocations out of range and crash during linking.
+    // With deferred stubs, local branches are relaxed during final emission.
     Manager.registerPass(std::make_unique<LongJmpPass>(PrintLongJmp));
 
     Manager.registerPass(

@@ -71,7 +71,7 @@ There is one owner of each decision:
 
 | Stage | Responsibility |
 | --- | --- |
-| MC emission | Final fragment bytes, internal references and alignments. |
+| MC emission | Local conditional branch relaxation, final fragment bytes, internal references and alignments. |
 | `mergeFragmentSections` | Validate relocations, group blocks by logical section and preserve emission order. No byte placement. |
 | Post-prune placement | Assign section-relative block addresses and insert islands; accepted fragments never move again. |
 | Memory manager | Allocate the resulting extent and copy at those offsets. No packing decisions. |
@@ -92,8 +92,26 @@ It is valid after section-relative placement and before virtual-address rebasing
 it is not a general query for section contents at any graph stage.
 
 Unlike global `LongJmpPass` relaxation, there is no estimated function layout,
-cluster graph, branch-chain insertion or iterative convergence. Existing local
-basic-block relaxation in `LongJmpPass` still runs inside each fragment.
+cluster graph, branch-chain insertion or iterative convergence for global
+branches. With `--turn-off-stubs`, `LongJmpPass` only prepares BTI destinations.
+`emitFunctionBody` relaxes local conditional branches after all passes, using
+the final instructions and conservative bounds for block alignment padding.
+It iterates a per-fragment expansion plan until all short branches fit. Branches
+between fragments are expanded to unconditional B relocations for JITLink.
+
+Expansion happens only in the MC streamer, without changing the finalized CFG
+or moving original instructions, CFI directives or instruction-address labels.
+Reversible branches use an inverted condition followed by B; irreversible
+branches use two local branches followed by B, preserving flags. Non-simple
+functions retain their internal layout and use end-of-function trampolines for
+external conditional branches, with a diagnostic if those are out of reach.
+Size-estimation emission during optimization does not run this relaxation.
+
+With `--update-debug-sections`, emission also records instruction ends separately
+from instruction starts. An input boundary can be both a call's return PC and a
+successor block's entry, which need not be adjacent in the output. Range and
+location-list ends and `DW_AT_call_return_pc` use the former mapping so they do
+not accidentally include a synthetic branch or point at a reordered successor.
 
 ## Existing per-function sections
 
@@ -137,6 +155,13 @@ The graph tests cover both Branch26 limits, unordered edges, aliases/addends,
 alignment gaps, empty markers, the last guard, indivisible fragments, actual
 content copying and repeated rebasing. Focused ELF tests cover ADRP/MOV, PIE,
 hot/cold sharing, runtime isolation and FDEs.
+
+Local-branch regressions also cover cascading forward/backward expansions,
+irreversible CMPBR with live flags, non-simple functions and unreachable
+trampolines. The DWARF 4/5 regression checks final DIE and line-table addresses,
+CFA and signed-RA rules around expansion, and decodes the emitted LSDA to verify
+the throwing call's range and landing-pad address. It also checks that a
+call-clobbered register's location range ends at the actual return PC.
 
 The synthetic 160 MiB three-caller case uses one reserved/materialized stub,
 compared with two before batching; a graph test covers fifteen callers over

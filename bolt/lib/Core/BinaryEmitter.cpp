@@ -12,17 +12,22 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Core/BinaryEmitter.h"
+#include "bolt/Core/AddressMap.h"
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Core/DebugData.h"
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/DebugInfo/DWARF/DWARFCompileUnit.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/LEB128.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SMLoc.h"
 
 #define DEBUG_TYPE "bolt"
@@ -122,6 +127,174 @@ bool fragmentMayFallThrough(const FunctionFragment &Fragment,
   }
   return false;
 }
+
+/// Plan conditional branch expansion using the final instructions. Do not
+/// modify the finalized CFG: in particular, moving an existing branch to a
+/// trampoline could separate it from its CFI and instruction-address labels.
+class LocalBranchRelaxation {
+  BinaryContext &BC;
+  DenseSet<const MCInst *> InlineBranches;
+  DenseMap<const MCInst *, MCSymbol *> TrampolineBranches;
+  SmallVector<std::pair<MCSymbol *, MCInst>, 0> Trampolines;
+  MCSymbol *TrampolinesEnd{nullptr};
+
+  uint64_t getExtraSize(const MCInst &Inst) const {
+    if (!InlineBranches.contains(&Inst))
+      return 0;
+    return BC.MIB->isReversibleBranch(Inst) ? 4 : 8;
+  }
+
+  MCInst createJump(const MCInst &Inst) const {
+    MCInst Jump;
+    BC.MIB->createUncondBranch(Jump, BC.MIB->getTargetSymbol(Inst),
+                               BC.Ctx.get());
+    // Preserve the complete destination, including a possible addend.
+    Jump.getOperand(0) = Inst.getOperand(MCPlus::getNumPrimeOperands(Inst) - 1);
+    return Jump;
+  }
+
+public:
+  explicit LocalBranchRelaxation(BinaryContext &BC) : BC(BC) {}
+
+  bool run(const BinaryFunction &BF, const FunctionFragment &FF) {
+    const bool PreserveLayout = !BF.isSimple() || BF.isPatch();
+    DenseMap<const BinaryBasicBlock *, uint64_t> BlockOffsets;
+    DenseMap<const MCInst *, uint64_t> BranchOffsets;
+    DenseMap<std::pair<const MCSymbol *, int64_t>, MCSymbol *>
+        SharedTrampolines;
+    uint64_t CodeSize;
+    bool Changed;
+    do {
+      // Budget the maximum padding at each block. Distances then bound the
+      // actual displacement independently of the fragment's final address.
+      CodeSize = 0;
+      for (const BinaryBasicBlock *BB : FF) {
+        if ((BC.AlignBlocks || BC.PreserveBlocksAlignment) &&
+            BB->getAlignment() > 1) {
+          const uint64_t MaxPadding = BB->getAlignment() - 1;
+          CodeSize +=
+              BB->getAlignmentMaxBytes()
+                  ? std::min<uint64_t>(MaxPadding, BB->getAlignmentMaxBytes())
+                  : MaxPadding;
+        }
+        BlockOffsets[BB] = CodeSize;
+        for (const MCInst &Inst : *BB) {
+          if (BC.MIB->isPseudo(Inst))
+            continue;
+          if (BC.MIB->isConditionalBranch(Inst))
+            BranchOffsets[&Inst] = CodeSize;
+          CodeSize += 4 + getExtraSize(Inst);
+        }
+      }
+
+      Changed = false;
+      for (const BinaryBasicBlock *BB : FF) {
+        for (const MCInst &Inst : *BB) {
+          if (!BC.MIB->isConditionalBranch(Inst) ||
+              InlineBranches.contains(&Inst) ||
+              TrampolineBranches.contains(&Inst))
+            continue;
+          const MCSymbol *Target = BC.MIB->getTargetSymbol(Inst);
+          const BinaryBasicBlock *TargetBB = BF.getBasicBlockForLabel(Target);
+          if (TargetBB && PreserveLayout)
+            continue;
+          const unsigned Bits = BC.MIB->getPCRelEncodingSize(Inst);
+          if (TargetBB && TargetBB->getFragmentNum() == FF.getFragmentNum() &&
+              !BC.MIB->getTargetAddend(Inst) &&
+              isIntN(Bits, BlockOffsets.lookup(TargetBB) -
+                               BranchOffsets.lookup(&Inst)))
+            continue;
+
+          if (PreserveLayout) {
+            MCSymbol *&Label =
+                SharedTrampolines[{Target, BC.MIB->getTargetAddend(Inst)}];
+            if (!Label) {
+              Label = BC.Ctx->createTempSymbol("local_trampoline");
+              Trampolines.emplace_back(Label, createJump(Inst));
+            }
+            TrampolineBranches[&Inst] = Label;
+          } else {
+            InlineBranches.insert(&Inst);
+            Changed = true;
+          }
+        }
+      }
+      // Expanding a branch can push another one out of range. Decisions are
+      // monotonic, so the iteration terminates without changing any MCInst.
+    } while (Changed);
+
+    if (Trampolines.empty())
+      return true;
+
+    // A non-simple function cannot change its internal layout. As in LongJmp,
+    // relax its external conditional branches through end-of-function thunks.
+    if (fragmentMayFallThrough(FF, BC)) {
+      TrampolinesEnd = BC.Ctx->createTempSymbol("local_trampolines_end");
+      CodeSize += 4;
+    }
+    DenseMap<const MCSymbol *, uint64_t> TrampolineOffsets;
+    for (const auto &[Label, Jump] : Trampolines) {
+      TrampolineOffsets[Label] = CodeSize;
+      CodeSize += 4;
+    }
+    for (const auto &[Inst, Label] : TrampolineBranches) {
+      const unsigned Bits = BC.MIB->getPCRelEncodingSize(*Inst);
+      if (!isIntN(Bits, TrampolineOffsets.lookup(Label) -
+                            BranchOffsets.lookup(Inst))) {
+        BC.Ctx->reportError(Inst->getLoc(),
+                            Twine("cannot relax branch in function ") +
+                                BF.getPrintName() +
+                                ": end-of-function trampoline is out of reach");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool emit(const MCInst &Inst, MCStreamer &Streamer) const {
+    if (MCSymbol *Label = TrampolineBranches.lookup(&Inst)) {
+      MCInst Branch = Inst;
+      BC.MIB->replaceBranchTarget(Branch, Label, BC.Ctx.get());
+      Streamer.emitInstruction(Branch, *BC.STI);
+      return true;
+    }
+    if (!InlineBranches.contains(&Inst))
+      return false;
+
+    MCSymbol *End = BC.Ctx->createTempSymbol("local_branch_end");
+    if (BC.MIB->isReversibleBranch(Inst)) {
+      // Preserve flags: instruction analysis is no longer valid after lowering.
+      for (const MCInst &Branch :
+           BC.MIB->reverseBranchCondition(Inst, End, BC.Ctx.get()))
+        Streamer.emitInstruction(Branch, *BC.STI);
+    } else {
+      MCSymbol *Taken = BC.Ctx->createTempSymbol("local_branch_taken");
+      MCInst Branch = Inst;
+      BC.MIB->replaceBranchTarget(Branch, Taken, BC.Ctx.get());
+      Streamer.emitInstruction(Branch, *BC.STI);
+      BC.MIB->createUncondBranch(Branch, End, BC.Ctx.get());
+      Streamer.emitInstruction(Branch, *BC.STI);
+      Streamer.emitLabel(Taken);
+    }
+    Streamer.emitInstruction(createJump(Inst), *BC.STI);
+    Streamer.emitLabel(End);
+    return true;
+  }
+
+  void emitTrampolines(MCStreamer &Streamer) const {
+    if (TrampolinesEnd) {
+      MCInst Jump;
+      BC.MIB->createUncondBranch(Jump, TrampolinesEnd, BC.Ctx.get());
+      Streamer.emitInstruction(Jump, *BC.STI);
+    }
+    for (const auto &[Label, Jump] : Trampolines) {
+      Streamer.emitLabel(Label);
+      Streamer.emitInstruction(Jump, *BC.STI);
+    }
+    if (TrampolinesEnd)
+      Streamer.emitLabel(TrampolinesEnd);
+  }
+};
 
 class BinaryEmitter {
 private:
@@ -510,6 +683,12 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
 
 void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
                                      bool EmitCodeOnly) {
+  LocalBranchRelaxation Relaxation(BC);
+  // Size-estimation emission runs during optimization and must not relax code.
+  const bool RelaxBranches = useFragmentSections(BC) && !EmitCodeOnly;
+  if (RelaxBranches && !Relaxation.run(BF, FF))
+    return;
+
   if (!EmitCodeOnly && FF.isSplitFragment() && BF.hasConstantIsland()) {
     assert(BF.getLayout().isHotColdSplit() &&
            "Constant island support only with hot/cold split");
@@ -579,9 +758,21 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
         }
       }
 
-      Streamer.emitInstruction(Instr, *BC.STI);
+      if (!RelaxBranches || !Relaxation.emit(Instr, Streamer))
+        Streamer.emitInstruction(Instr, *BC.STI);
+
+      // A range ending at this instruction must stop before a synthetic branch
+      // or a reordered successor. In particular, call-clobbered locations are
+      // no longer valid at the B inserted after a call by fixBranches().
+      if (RelaxBranches && opts::UpdateDebugSections)
+        if (std::optional<uint32_t> Offset = BC.MIB->getOffset(Instr))
+          AddressMap::emitInstructionEnd(Streamer, BC,
+                                         BF.getAddress() + *Offset + 4);
     }
   }
+
+  if (RelaxBranches)
+    Relaxation.emitTrampolines(Streamer);
 
   if (!EmitCodeOnly)
     emitConstantIslands(BF, FF.isSplitFragment());

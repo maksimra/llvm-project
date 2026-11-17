@@ -1832,13 +1832,17 @@ void LongJmpPass::relaxWithClusters(BinaryContext &BC) {
 }
 
 Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
+  if (opts::DoNotUseStubs && BC.isELF() && BC.usesBTI())
+    prepareDeferredBTITargets(BC);
+
+  // Deferred linking relaxes local branches during final emission, after all
+  // passes that can change instruction sizes or finalize unwind information.
+  if (opts::DoNotUseStubs && BC.isELF())
+    return Error::success();
 
   assert((opts::CompactCodeModel || opts::ExperimentalRelaxation ||
           opts::SplitStrategy != opts::SplitFunctionsStrategy::CDSplit) &&
          "LongJmp cannot work with functions split in more than two fragments");
-
-  if (opts::DoNotUseStubs && BC.isELF() && BC.usesBTI())
-    prepareDeferredBTITargets(BC);
 
   DenseMap<BinaryFunction *, BranchLivenessInfo> BranchLiveness;
 
@@ -1862,7 +1866,7 @@ Error LongJmpPass::runOnFunctions(BinaryContext &BC) {
   };
 
   if (opts::CompactCodeModel || opts::ExperimentalRelaxation ||
-      opts:: DoNotUseStubs) {
+      opts::DoNotUseStubs) {
     BC.outs()
         << "BOLT-INFO: relaxing branches for compact code model (<128MB)\n";
 
