@@ -17,7 +17,7 @@ B [current batch] C [placed look-ahead] [new island] D [unplaced fragments]
 1. Advance D, placing whole fragments while leaving a 16 MiB island allowance
    within Branch26 range (128 MiB) of B. At least one fragment is accepted.
 2. Select C: approximately 32 MiB of code, also bounded by the number of branches
-   not proven direct in the already placed prefix, at 20 bytes per candidate.
+   not proven direct in the already placed prefix, at 12 bytes per candidate.
    This is an upper bound: sharing can further reduce the slots actually needed.
    A large fragment remains indivisible.
 3. `reserveBatch` visits B..C in source-address order. A proven direct branch
@@ -53,7 +53,8 @@ graph's edges.
 
 After final addresses are known, `repairEdges` keeps direct branches or reuses a
 materialized stub by numeric target address, including across output sections.
-Otherwise it fills the reserved slot with ADRP/ADD/BR or MOV/BR. Unused slots
+Otherwise it fills the 12-byte reserved slot with ADRP/ADD/BR. A target outside
+ADRP range is diagnosed, including in fixed-address binaries. Unused slots
 remain NOPs. This phase changes neither block sizes nor placement.
 
 For BTI binaries, `LongJmpPass` prepares known emitted branch destinations and
@@ -154,7 +155,7 @@ island offsets are not printed. Batches reusing earlier islands still contribute
 to the batch count, but do not increase the island or slot counts.
 
 These are placement/reservation statistics, before virtual address mapping and
-materialization. Final ADRP/MOV/unused/shared counts remain controlled by
+materialization. Final ADRP/unused/shared counts remain controlled by
 `--print-stub-stats`. No additional command-line option is required for batch
 diagnostics. The optional `raw_ostream *Log` parameter lets graph unit tests
 exercise placement without producing informational output.
@@ -163,8 +164,8 @@ exercise placement without producing informational output.
 
 The graph tests cover both Branch26 limits, unordered edges, aliases/addends,
 alignment gaps, empty markers, the last guard, indivisible fragments, actual
-content copying and repeated rebasing. Focused ELF tests cover ADRP/MOV, PIE,
-hot/cold sharing, runtime isolation and FDEs.
+content copying and repeated rebasing. Focused ELF tests cover ADRP, out-of-range
+errors, PIE, hot/cold sharing, runtime isolation and FDEs.
 
 Local-branch regressions also cover cascading forward/backward expansions,
 irreversible CMPBR with live flags, non-simple functions and unreachable

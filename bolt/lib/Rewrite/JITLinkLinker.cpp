@@ -30,6 +30,8 @@ namespace bolt {
 
 namespace {
 
+constexpr uint64_t AArch64StubSize = 12;
+
 [[maybe_unused]] std::string formatSignedHex(int64_t Value) {
   const uint64_t Magnitude = Value < 0 ? -uint64_t(Value) : uint64_t(Value);
   return ((Value < 0 ? "-0x" : "0x") + Twine::utohexstr(Magnitude)).str();
@@ -149,53 +151,36 @@ Error ensureAArch64BTITarget(BinaryContext &BC,
       ": target has no compatible BTI landing pad or NOP to patch");
 }
 
-/// Return true for a short (ADRP) stub and false for a long (MOV) stub.
-Expected<bool> materializeAArch64Stub(jitlink::Symbol &SlotSym,
-                                      jitlink::Symbol &Target,
-                                      jitlink::Edge::AddendT Addend,
-                                      bool HasFixedLoadAddress) {
+Error materializeAArch64Stub(jitlink::Symbol &SlotSym, jitlink::Symbol &Target,
+                             jitlink::Edge::AddendT Addend) {
   const auto TargetAddress = Target.getAddress() + Addend;
 
   const int64_t PageDelta =
       static_cast<int64_t>(TargetAddress.getValue() >> 12) -
       static_cast<int64_t>(SlotSym.getAddress().getValue() >> 12);
-  const bool UseADRP = isInt<21>(PageDelta);
-  if (!UseADRP && !HasFixedLoadAddress)
+  if (!isInt<21>(PageDelta))
     return make_error<jitlink::JITLinkError>(
         "Cannot materialize AArch64 branch stub at 0x" +
         Twine::utohexstr(SlotSym.getAddress().getValue()) + " for target 0x" +
         Twine::utohexstr(TargetAddress.getValue()) +
-        ": target is outside ADRP range and the binary has no fixed load "
-        "address");
+        ": target is outside ADRP range");
 
   auto &SlotBlock = SlotSym.getBlock();
   const auto SlotOffset = SlotSym.getOffset();
-  auto Slot = SlotBlock.getAlreadyMutableContent().slice(SlotOffset, 20);
-  if (UseADRP) {
-    support::endian::write32le(Slot.data(), 0x90000010);     // ADRP x16
-    support::endian::write32le(Slot.data() + 4, 0x91000210); // ADD x16, x16
-    support::endian::write32le(Slot.data() + 8, 0xd61f0200); // BR x16
-    SlotBlock.addEdge(jitlink::aarch64::Page21, SlotOffset, Target, Addend);
-    SlotBlock.addEdge(jitlink::aarch64::PageOffset12, SlotOffset + 4, Target,
-                      Addend);
+  auto Slot =
+      SlotBlock.getAlreadyMutableContent().slice(SlotOffset, AArch64StubSize);
+  support::endian::write32le(Slot.data(), 0x90000010);     // ADRP x16
+  support::endian::write32le(Slot.data() + 4, 0x91000210); // ADD x16, x16
+  support::endian::write32le(Slot.data() + 8, 0xd61f0200); // BR x16
+  SlotBlock.addEdge(jitlink::aarch64::Page21, SlotOffset, Target, Addend);
+  SlotBlock.addEdge(jitlink::aarch64::PageOffset12, SlotOffset + 4, Target,
+                    Addend);
 
-    // Leave the final eight bytes as reserved NOPs.
-  } else {
-    for (unsigned I = 0; I != 4; ++I) {
-      const uint32_t Imm16 = (TargetAddress.getValue() >> (16 * I)) & 0xffff;
-      // MOVZ x16 for the first chunk, MOVK x16 for the rest.
-      const uint32_t Opcode = I == 0 ? 0xd2800000 : 0xf2800000;
-      const uint32_t Instr = Opcode | (I << 21) | (Imm16 << 5) | 16;
-      support::endian::write32le(Slot.data() + 4 * I, Instr);
-    }
-    support::endian::write32le(Slot.data() + 16, 0xd61f0200); // BR x16
-  }
-  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: " << (UseADRP ? "short" : "long")
-                    << " jump stub was materialized at 0x"
+  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: short jump stub was materialized at 0x"
                     << Twine::utohexstr(SlotSym.getAddress().getValue())
                     << ", target 0x"
                     << Twine::utohexstr(TargetAddress.getValue()) << '\n');
-  return UseADRP;
+  return Error::success();
 }
 
 } // anonymous namespace
@@ -278,7 +263,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
   }
 
   Error repairEdges(jitlink::LinkGraph &G) {
-    uint64_t NumShortStubs = 0, NumLongStubs = 0, NumSharedStubs = 0;
+    uint64_t NumShortStubs = 0, NumSharedStubs = 0;
 
     SmallVector<jitlink::Block *> CodeBlocks;
     if (Linker.BC.usesBTI()) {
@@ -340,15 +325,10 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                                                    TargetAddress.getValue()))
               return Err;
 
-          auto IsShort = materializeAArch64Stub(
-              *Record.SlotSym, Edge.getTarget(), Edge.getAddend(),
-              Linker.BC.HasFixedLoadAddress);
-          if (!IsShort)
-            return IsShort.takeError();
-          if (*IsShort)
-            ++NumShortStubs;
-          else
-            ++NumLongStubs;
+          if (Error Err = materializeAArch64Stub(
+                  *Record.SlotSym, Edge.getTarget(), Edge.getAddend()))
+            return Err;
+          ++NumShortStubs;
           Stubs.push_back(Record.SlotSym);
 
           Edge.setTarget(*Record.SlotSym);
@@ -359,10 +339,9 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
 
     if (opts::PrintStubStats)
       Linker.BC.outs() << "BOLT-INFO: JITLink stubs: slots="
-                       << StubRecords.size() << " unused="
-                       << StubRecords.size() - NumShortStubs - NumLongStubs
-                       << " short-adrp=" << NumShortStubs
-                       << " long-mov=" << NumLongStubs
+                       << StubRecords.size()
+                       << " unused=" << StubRecords.size() - NumShortStubs
+                       << " short-adrp=" << NumShortStubs << " long-mov=0"
                        << " shared=" << NumSharedStubs << '\n';
 
     return Error::success();
@@ -719,7 +698,6 @@ class AArch64StubPlacer {
   static constexpr uint64_t BranchDistance = 128 * 1024 * 1024;
   static constexpr uint64_t BatchSize = 32 * 1024 * 1024;
   static constexpr uint64_t MaxIslandSize = 16 * 1024 * 1024;
-  static constexpr uint64_t StubSize = 20;
   static constexpr uint64_t Unplaced = std::numeric_limits<uint64_t>::max();
 
   jitlink::LinkGraph &G;
@@ -768,7 +746,7 @@ public:
              Blocks[C]->getAddress().getValue() + Blocks[C]->getSize() <
                  Blocks[B]->getAddress().getValue() + BatchSize) {
         const uint64_t Next = countStubCandidates(*Blocks[C]);
-        if (NumCandidates + Next > MaxIslandSize / StubSize)
+        if (NumCandidates + Next > MaxIslandSize / AArch64StubSize)
           break;
         NumCandidates += Next;
         ++C;
@@ -790,7 +768,7 @@ public:
           GuardBytes += 4;
       }
       const uint64_t NumSlots = Stubs.size() - FirstStub;
-      const uint64_t StubBytes = NumSlots * StubSize;
+      const uint64_t StubBytes = NumSlots * AArch64StubSize;
       const uint64_t Total = JITLinkLinker::getSectionAllocationSize(Section);
       *Log << "BOLT-INFO: JITLink batches: section=" << Section.getName()
            << " batches=" << NumBatches << " fragments=" << Blocks.size()
@@ -875,7 +853,7 @@ private:
             return make_error<jitlink::JITLinkError>(
                 "Cannot place a reachable AArch64 stub island in " +
                 Section.getName() + ": emitted fragment is too large");
-          if (SlotOffset + StubSize > MaxIslandSize)
+          if (SlotOffset + AArch64StubSize > MaxIslandSize)
             return make_error<jitlink::JITLinkError>(
                 "AArch64 stub island exceeds its reserved size in " +
                 Section.getName());
@@ -883,11 +861,11 @@ private:
             Island = &G.createZeroFillBlock(
                 Section, 0, orc::ExecutorAddr(IslandOffset), 4, 0);
           // Grow the block without allocating bytes until its size is known.
-          Island->setZeroFillSize(SlotOffset + StubSize);
+          Island->setZeroFillSize(SlotOffset + AArch64StubSize);
           It->second = Stubs.size();
-          Stubs.push_back(
-              {&G.addAnonymousSymbol(*Island, SlotOffset, StubSize, true, true),
-               {}});
+          Stubs.push_back({&G.addAnonymousSymbol(*Island, SlotOffset,
+                                                 AArch64StubSize, true, true),
+                           {}});
         }
         Stubs[It->second].Branches.push_back({Block, Edge->getOffset()});
       }

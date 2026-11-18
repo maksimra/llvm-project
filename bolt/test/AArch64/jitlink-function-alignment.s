@@ -9,8 +9,7 @@
 ## The compact aligner requests only four-byte alignment without a profile.
 # RUN: llvm-bolt %t.exe -o %t.classic --lite=0
 # RUN: llvm-bolt %t.exe -o %t.compact --lite=0 --turn-off-stubs \
-# RUN:   --verify-branch26-range | FileCheck %s --check-prefix=COMPACT
-# COMPACT: JITLink layout: section=.text emitted-bytes=44 guard-bytes=0 stub-bytes=0 alignment-bytes=0 total-bytes=44
+# RUN:   --verify-branch26-range
 # RUN: llvm-nm -n %t.classic > %t.classic.nm
 # RUN: llvm-nm -n %t.compact > %t.compact.nm
 # RUN: diff %t.classic.nm %t.compact.nm
@@ -18,9 +17,7 @@
 ## With a 32-byte budget, skip padding of 60/56 bytes, but accept 28 bytes.
 # RUN: llvm-bolt %t.exe -o %t.classic.bounded --lite=0 --use-compact-aligner=0
 # RUN: llvm-bolt %t.exe -o %t.bounded --lite=0 --use-compact-aligner=0 \
-# RUN:   --turn-off-stubs --verify-branch26-range \
-# RUN:   | FileCheck %s --check-prefix=BOUNDED
-# BOUNDED: JITLink layout: section=.text emitted-bytes=44 guard-bytes=0 stub-bytes=0 alignment-bytes=28 total-bytes=72
+# RUN:   --turn-off-stubs --verify-branch26-range
 # RUN: llvm-nm -n %t.classic.bounded > %t.classic.bounded.nm
 # RUN: llvm-nm -n %t.bounded > %t.bounded.nm
 # RUN: diff %t.classic.bounded.nm %t.bounded.nm
@@ -28,8 +25,7 @@
 ## A zero budget disables preferred alignment instead of requesting unlimited
 ## padding (the latter is the MC API's meaning of MaxBytesToEmit=0).
 # RUN: llvm-bolt %t.exe -o %t.zero --lite=0 --use-compact-aligner=0 \
-# RUN:   --align-functions-max-bytes=0 --turn-off-stubs --verify-branch26-range \
-# RUN:   | FileCheck %s --check-prefix=COMPACT
+# RUN:   --align-functions-max-bytes=0 --turn-off-stubs --verify-branch26-range
 # RUN: llvm-nm -n %t.zero > %t.zero.nm
 # RUN: diff %t.classic.nm %t.zero.nm
 
@@ -38,9 +34,7 @@
 # RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux %t/island.s -o %t.ci.o
 # RUN: ld.lld --emit-relocs -e _start %t.ci.o -o %t.ci.exe
 # RUN: llvm-bolt %t.ci.exe -o %t.ci.bolt --lite=0 --turn-off-stubs \
-# RUN:   --align-functions-max-bytes=0 --verify-branch26-range \
-# RUN:   | FileCheck %s --check-prefix=ISLAND
-# ISLAND: JITLink layout: section=.text emitted-bytes=28 guard-bytes=0 stub-bytes=0 alignment-bytes=4 total-bytes=32
+# RUN:   --align-functions-max-bytes=0 --verify-branch26-range
 # RUN: llvm-nm -n %t.ci.bolt | FileCheck %s --check-prefix=CI-ENTRY
 # CI-ENTRY: {{[0-9a-f]*[08]}} T with_island
 # RUN: llvm-objdump -d --section=.text --disassemble-symbols='$d' %t.ci.bolt \
@@ -56,7 +50,6 @@
 # RUN: llvm-bolt %t.split.exe -o %t.split.bolt --lite=0 --turn-off-stubs \
 # RUN:   --data=%t.fdata --split-functions --verify-branch26-range --print-stub-stats \
 # RUN:   | FileCheck %s --check-prefix=COLD
-# COLD: JITLink layout: section=.text.cold emitted-bytes=16 guard-bytes=0 stub-bytes=0 alignment-bytes=0 total-bytes=16
 ## Cross-section branches still reserve slots before section bases are known.
 # COLD: JITLink stubs: slots=2 unused=2 short-adrp=0 long-mov=0 shared=0
 # RUN: llvm-nm -n %t.split.bolt | FileCheck %s --check-prefix=COLD-NM

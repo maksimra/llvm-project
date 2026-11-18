@@ -107,11 +107,13 @@ protected:
   }
 
   void checkReachability(ArrayRef<JITLinkLinker::AArch64Stub> Stubs) {
-    for (const auto &Stub : Stubs)
+    for (const auto &Stub : Stubs) {
+      EXPECT_EQ(Stub.SlotSym->getSize(), 12u);
       for (const auto &Branch : Stub.Branches)
         EXPECT_TRUE(isInt<28>(
             int64_t(Stub.SlotSym->getAddress() -
                     (Branch.SourceBlock->getAddress() + Branch.SourceOffset))));
+    }
   }
 };
 
@@ -126,14 +128,15 @@ TEST_F(AArch64StubBatchTest, ForwardIslandSharesAcrossMoreThanBranchDistance) {
   EXPECT_EQ(Stubs->front().Branches.size(), 15u);
   checkReachability(*Stubs);
   EXPECT_EQ(Stubs->front().SlotSym->getAddress().getValue(), 112 * MiB);
+  EXPECT_EQ(Stubs->front().SlotSym->getBlock().getSize(), 12u);
 }
 
 TEST_F(AArch64StubBatchTest, NegativeLimitIsInclusive) {
   branch(block(4), 0, Far);
   block(112 * MiB - 4);
-  auto &Last = block(128 * MiB - 12);
-  branch(Last, 128 * MiB - 20, Far);
-  branch(Last, 128 * MiB - 16, Far);
+  auto &Last = block(128 * MiB - 4);
+  branch(Last, 128 * MiB - 12, Far);
+  branch(Last, 128 * MiB - 8, Far);
   auto Stubs = reserve();
   ASSERT_TRUE(bool(Stubs)) << toString(Stubs.takeError());
   ASSERT_EQ(Stubs->size(), 2u);
@@ -141,7 +144,7 @@ TEST_F(AArch64StubBatchTest, NegativeLimitIsInclusive) {
   EXPECT_EQ((*Stubs)[1].Branches.size(), 1u);
   checkReachability(*Stubs);
   EXPECT_EQ(int64_t((*Stubs)[0].SlotSym->getAddress() -
-                    (Last.getAddress() + 128 * MiB - 20)),
+                    (Last.getAddress() + 128 * MiB - 12)),
             -int64_t(128 * MiB));
 }
 
@@ -206,10 +209,10 @@ TEST_F(AArch64StubBatchTest, SkipProvenDirectBranches) {
 }
 
 TEST_F(AArch64StubBatchTest, DirectBranchesDoNotConsumeIslandBudget) {
-  // One more branch than a 16 MiB island could hold in 20-byte slots. All
+  // One more branch than a 16 MiB island could hold in 12-byte slots. All
   // targets are already placed and reachable, so the two fragments should
   // remain in one batch without reserving any slots.
-  constexpr unsigned MaxSlots = 16 * MiB / 20;
+  constexpr unsigned MaxSlots = 16 * MiB / 12;
   auto &Dense = block(4 * MaxSlots);
   auto &Caller = block(4);
   auto &Target = G.addAnonymousSymbol(Dense, 0, 4, true, true);
@@ -302,8 +305,8 @@ TEST_F(AArch64StubBatchTest, LastGuardSkipsTailIsland) {
   checkReachability(*Stubs);
   auto &Guard = *std::next(Caller.edges().begin());
   EXPECT_EQ(Guard.getOffset(), 4u);
-  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 28u);
-  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), 28u);
+  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 20u);
+  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), 20u);
 }
 
 TEST_F(AArch64StubBatchTest, LastGuardSkipsTailIslandsFromEarlierBatches) {
@@ -317,8 +320,8 @@ TEST_F(AArch64StubBatchTest, LastGuardSkipsTailIslandsFromEarlierBatches) {
   ASSERT_EQ(Stubs->size(), 4u);
   checkReachability(*Stubs);
   auto &Guard = *std::next(Callers.back()->edges().begin());
-  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 64 * MiB + 80);
-  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), 64 * MiB + 80);
+  EXPECT_EQ(Guard.getTarget().getAddress().getValue(), 64 * MiB + 48);
+  EXPECT_EQ(JITLinkLinker::getSectionAllocationSize(Text), 64 * MiB + 48);
 }
 
 } // namespace

@@ -1,6 +1,6 @@
 ## Deferred stubs use BR x16. Prepare emitted destinations before relaxation,
 ## preserve existing explicit/implicit landing pads, and check the exact final
-## target before materializing either an ADRP or a MOV stub.
+## target before materializing an ADRP stub.
 
 # REQUIRES: system-linux
 # RUN: split-file %s %t
@@ -41,7 +41,7 @@
 # RUN:   --print-stub-stats | FileCheck %s --check-prefix=TARGET-STATS
 
 ## A skipped function cannot grow. Patch its entry NOP only when an indirect
-## stub is actually needed, including for MOV stubs and shared reservations.
+## stub is actually needed, including for shared reservations.
 # RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux -mattr=+bti \
 # RUN:   -aarch64-mark-bti-property --defsym=NOP=1 %t/skipped.s -o %t.nop.o
 # RUN: ld.lld --emit-relocs -e caller %t.nop.o -o %t.nop
@@ -56,13 +56,11 @@
 # PATCH-NEXT: bti c
 # PATCH-NEXT: mov x0, #0x2a
 # PATCH-NEXT: ret
-# RUN: llvm-bolt %t.nop -o %t.mov.bolt --turn-off-stubs --lite=0 \
+# RUN: not llvm-bolt %t.nop -o %t.out-of-range --turn-off-stubs --lite=0 \
 # RUN:   --skip-funcs=callee --align-functions=4 --use-gnu-stack \
 # RUN:   --custom-allocation-vma=0x1234500000 --print-stub-stats \
-# RUN:   | FileCheck %s --check-prefix=MOV-STATS
-# MOV-STATS: JITLink stubs: slots=1 unused=0 short-adrp=0 long-mov=1 shared=2
-# RUN: llvm-objdump -d --no-show-raw-insn --mattr=+bti \
-# RUN:   --disassemble-symbols=callee %t.mov.bolt | FileCheck %s --check-prefix=PATCH
+# RUN:   2>&1 | FileCheck %s --check-prefix=OUT-OF-RANGE
+# OUT-OF-RANGE: BOLT-ERROR: JITLink failed: Cannot materialize AArch64 branch stub at 0x{{[0-9a-f]+}} for target 0x{{[0-9a-f]+}}: target is outside ADRP range
 
 ## Existing landing pads on skipped functions are accepted without patching.
 # RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux -mattr=+bti \

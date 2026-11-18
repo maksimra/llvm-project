@@ -9,13 +9,13 @@
 # RUN: llvm-strip --strip-unneeded %t.exe
 # RUN: llvm-bolt %t.exe -o %t.bolt --data=%t.fdata --split-functions \
 # RUN:   --funcs=caller --turn-off-stubs --lite=0 --align-functions=16 \
-# RUN:   --custom-allocation-vma=0x1234500000 --use-gnu-stack \
+# RUN:   --custom-allocation-vma=0x40000000 --use-gnu-stack \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=STATS
 
 ## Each section reserves a slot for callee. Only one is materialized. The
 ## third reservation is for the direct hot-to-cold branch and remains unused.
-# STATS: BOLT-INFO: JITLink stubs: slots=3 unused=2 short-adrp=0 long-mov=1 shared=2
+# STATS: BOLT-INFO: JITLink stubs: slots=3 unused=2 short-adrp=1 long-mov=0 shared=2
 # RUN: llvm-objdump -d --no-show-raw-insn \
 # RUN:   --disassemble-symbols=caller,caller.cold.0 %t.bolt | FileCheck %s
 # CHECK: Disassembly of section .text:

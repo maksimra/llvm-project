@@ -41,15 +41,18 @@
 # RUN:   %t.pie.bolt | FileCheck %s --check-prefixes=SHARED,SHORT
 
 ## Keep callee at its original address and move callers beyond ADRP range.
-## The two shared slots must each materialize a single MOVZ/MOVK/BR sequence.
-# RUN: llvm-bolt %t.exe -o %t.long --turn-off-stubs --lite=0 \
+## Both fixed-address and position-independent binaries must report an error.
+# RUN: not llvm-bolt %t.exe -o %t.out-of-range --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 --skip-funcs=callee --use-gnu-stack \
 # RUN:   --custom-allocation-vma=0x1234500000 \
 # RUN:   --print-stub-stats --verify-branch26-range \
-# RUN:   | FileCheck %s --check-prefix=LONG-STATS
-# LONG-STATS: BOLT-INFO: JITLink stubs: slots=2 unused=0 short-adrp=0 long-mov=2 shared=4
-# RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=_start,second \
-# RUN:   %t.long | FileCheck %s --check-prefixes=SHARED,LONG
+# RUN:   2>&1 | FileCheck %s --check-prefix=OUT-OF-RANGE
+# RUN: not llvm-bolt %t.pie -o %t.pie.out-of-range --turn-off-stubs --lite=0 \
+# RUN:   --align-functions=16 --skip-funcs=callee --use-gnu-stack \
+# RUN:   --custom-allocation-vma=0x1234500000 \
+# RUN:   --print-stub-stats --verify-branch26-range \
+# RUN:   2>&1 | FileCheck %s --check-prefix=OUT-OF-RANGE
+# OUT-OF-RANGE: BOLT-ERROR: JITLink failed: Cannot materialize AArch64 branch stub at 0x{{[0-9a-f]+}} for target 0x{{[0-9a-f]+}}: target is outside ADRP range
 
 # SHARED-LABEL: <_start>:
 # SHARED-NEXT: bl 0x[[#%x,STUB:]]
@@ -62,23 +65,9 @@
 # SHORT-NEXT: {{0*}}[[#STUB]]: adrp x16,
 # SHORT-NEXT: add x16, x16, #0x[[#%x,TARGET_LO:]]
 # SHORT-NEXT: br x16
-# SHORT-NEXT: nop
-# SHORT-NEXT: nop
 # SHORT-NEXT: {{0*}}[[#OFFSET_STUB]]: adrp x16,
 # SHORT-NEXT: add x16, x16, #0x[[#TARGET_LO + 4]]
 # SHORT-NEXT: br x16
-# SHORT-NEXT: nop
-# SHORT-NEXT: nop
-# LONG-NEXT: {{0*}}[[#STUB]]: mov x16, #0x[[#%x,TARGET_LO:]]
-# LONG-NEXT: movk x16, #0x[[#%x,TARGET_HI:]], lsl #16
-# LONG-NEXT: movk x16, #0x0, lsl #32
-# LONG-NEXT: movk x16, #0x0, lsl #48
-# LONG-NEXT: br x16
-# LONG-NEXT: {{0*}}[[#OFFSET_STUB]]: mov x16, #0x[[#TARGET_LO + 4]]
-# LONG-NEXT: movk x16, #0x[[#TARGET_HI]], lsl #16
-# LONG-NEXT: movk x16, #0x0, lsl #32
-# LONG-NEXT: movk x16, #0x0, lsl #48
-# LONG-NEXT: br x16
 
 ## A shared reservation outside Branch26 range must not be reused. Padding
 ## before each of second and callee leaves both callers out of target range,
@@ -94,22 +83,22 @@
 # SEPARATED-CODE-LABEL: <_start>:
 # SEPARATED-CODE-NEXT: bl 0x[[#%x,FIRST_STUB:]]
 # SEPARATED-CODE-NEXT: bl 0x[[#FIRST_STUB]]
-# SEPARATED-CODE-NEXT: bl 0x[[#FIRST_STUB + 20]]
+# SEPARATED-CODE-NEXT: bl 0x[[#FIRST_STUB + 12]]
 # SEPARATED-CODE-NEXT: b 0x[[#FIRST_STUB]]
 # SEPARATED-CODE: [[#%x,SECOND:]] <second>:
 # SEPARATED-CODE-NEXT: bl 0x[[#SECOND + 8]]
-# SEPARATED-CODE-NEXT: b 0x[[#SECOND + 28]]
+# SEPARATED-CODE-NEXT: b 0x[[#SECOND + 20]]
 
 ## The negative Branch26 limit is inclusive. Increasing this padding by four
 ## bytes makes only second's last branch unable to reach its original slot.
 # RUN: llvm-bolt %t.exe -o %t.boundary --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 \
-# RUN:   --pad-funcs-before=second:134217684,callee:134217984 \
+# RUN:   --pad-funcs-before=second:134217700,callee:134217984 \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=FAR
 # RUN: llvm-bolt %t.exe -o %t.beyond --turn-off-stubs --lite=0 \
 # RUN:   --align-functions=16 \
-# RUN:   --pad-funcs-before=second:134217688,callee:134217984 \
+# RUN:   --pad-funcs-before=second:134217704,callee:134217984 \
 # RUN:   --print-stub-stats --verify-branch26-range \
 # RUN:   | FileCheck %s --check-prefix=BEYOND
 # BEYOND: BOLT-INFO: JITLink stubs: slots=3 unused=0 short-adrp=3 long-mov=0 shared=3

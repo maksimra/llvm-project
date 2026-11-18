@@ -10,12 +10,11 @@
 # RUN:   --custom-allocation-vma=0x40000000 \
 # RUN:   --pad-funcs-before=second:83886080,third:83886080 \
 # RUN:   --print-stub-stats --verify-branch26-range \
-# RUN:   | FileCheck %s --check-prefixes=BATCHES,STATS \
-# RUN:     --implicit-check-not="BOLT-INFO: JITLink batch:"
-## Report the three batches together, including batches reusing an older island.
-# BATCHES: BOLT-INFO: JITLink batches: section=.text batches=3 fragments=3 islands=1 slots=1
-# BATCHES-NEXT: BOLT-INFO: JITLink layout: section=.text emitted-bytes=167772172 guard-bytes=0 stub-bytes=20 alignment-bytes=0 total-bytes=167772192
+# RUN:   | FileCheck %s --check-prefix=STATS
 # STATS: BOLT-INFO: JITLink stubs: slots=1 unused=0 short-adrp=1 long-mov=0 shared=2
+## The emitted 167772172 bytes plus one 12-byte slot need no extra padding.
+# RUN: llvm-readelf -SW %t.bolt | FileCheck %s --check-prefix=SIZE
+# SIZE: .text PROGBITS {{[0-9a-f]+}} {{[0-9a-f]+}} a000018
 # RUN: llvm-objdump -d --no-show-raw-insn \
 # RUN:   --disassemble-symbols=_start,second,third %t.bolt | FileCheck %s
 
@@ -26,33 +25,17 @@
 # CHECK-NEXT: {{0*}}[[#STUB]]: adrp x16,
 # CHECK-NEXT: add x16, x16,
 # CHECK-NEXT: br x16
-# CHECK-NEXT: nop
-# CHECK-NEXT: nop
 # CHECK-LABEL: <third>:
 # CHECK-NEXT: b 0x[[#STUB]]
 
-## The same shared island also supports absolute MOV stubs beyond ADRP range.
-# RUN: llvm-bolt %t.exe -o %t.long --turn-off-stubs --lite=0 \
+## Targets beyond ADRP range are rejected even in a fixed-address binary.
+# RUN: not llvm-bolt %t.exe -o %t.out-of-range --turn-off-stubs --lite=0 \
 # RUN:   --skip-funcs=callee --align-functions=4 --use-gnu-stack \
 # RUN:   --custom-allocation-vma=0x1234500000 \
 # RUN:   --pad-funcs-before=second:83886080,third:83886080 \
 # RUN:   --print-stub-stats --verify-branch26-range \
-# RUN:   | FileCheck %s --check-prefix=LONG-STATS
-# LONG-STATS: BOLT-INFO: JITLink stubs: slots=1 unused=0 short-adrp=0 long-mov=1 shared=2
-# RUN: llvm-objdump -d --no-show-raw-insn \
-# RUN:   --disassemble-symbols=_start,second,third %t.long \
-# RUN:   | FileCheck %s --check-prefix=LONG
-# LONG-LABEL: <_start>:
-# LONG-NEXT: b 0x[[#%x,STUB:]]
-# LONG-LABEL: <second>:
-# LONG-NEXT: b 0x[[#STUB]]
-# LONG-NEXT: {{0*}}[[#STUB]]: mov x16,
-# LONG-NEXT: movk x16,
-# LONG-NEXT: movk x16,
-# LONG-NEXT: movk x16,
-# LONG-NEXT: br x16
-# LONG-LABEL: <third>:
-# LONG-NEXT: b 0x[[#STUB]]
+# RUN:   2>&1 | FileCheck %s --check-prefix=OUT-OF-RANGE
+# OUT-OF-RANGE: BOLT-ERROR: JITLink failed: Cannot materialize AArch64 branch stub at 0x{{[0-9a-f]+}} for target 0x{{[0-9a-f]+}}: target is outside ADRP range
 
 .text
 .globl _start
