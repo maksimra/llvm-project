@@ -21,6 +21,12 @@
 # RUN:   --reorder-blocks=reverse
 # RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=swap %t.swap.bolt \
 # RUN:   | FileCheck %s --check-prefix=SWAP
+## Debug-range preparation splits the synthetic B into the next BB; the pair
+## must still use the same short inversion without adding instructions.
+# RUN: llvm-bolt %t.swap -o %t.swap.debug.bolt --turn-off-stubs --lite=0 \
+# RUN:   --keep-nops --reorder-blocks=reverse --update-debug-sections
+# RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=swap %t.swap.debug.bolt \
+# RUN:   | FileCheck %s --check-prefix=SWAP
 # SWAP-LABEL: <swap>:
 # SWAP-NEXT: b.ne 0x[[#%x,NEAR:]]
 # SWAP-NEXT: b 0x[[#%x,FAR:]]

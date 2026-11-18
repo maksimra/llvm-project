@@ -37,16 +37,11 @@ class BinaryContext;
 /// labels (MCSymbol). Input addresses support one-to-many mapping.
 class AddressMap {
   static const char *const AddressSectionName;
-  static const char *const InstructionEndSectionName;
   static const char *const LabelSectionName;
 
   /// Map multiple <input address> to <output address>.
   using Addr2AddrMapTy = std::unordered_multimap<uint64_t, uint64_t>;
   Addr2AddrMapTy Address2AddressMap;
-
-  /// Instruction ends need a separate map: an input boundary can be both the
-  /// return PC of a call and the start of a differently placed successor.
-  Addr2AddrMapTy InstructionEndMap;
 
   /// Map MCSymbol to its output address. Normally used for temp symbols that
   /// are not updated by the linker.
@@ -56,17 +51,6 @@ class AddressMap {
 public:
   static void emit(MCStreamer &Streamer, BinaryContext &BC);
   static std::optional<AddressMap> parse(BinaryContext &BC);
-
-  /// Record the current position as the output end of an input instruction.
-  static void emitInstructionEnd(MCStreamer &Streamer, BinaryContext &BC,
-                                 uint64_t InputEndAddress);
-
-  std::optional<uint64_t> lookupInstructionEnd(uint64_t InputAddress) const {
-    auto It = InstructionEndMap.find(InputAddress);
-    if (It != InstructionEndMap.end())
-      return It->second;
-    return std::nullopt;
-  }
 
   std::optional<uint64_t> lookup(uint64_t InputAddress) const {
     auto It = Address2AddressMap.find(InputAddress);

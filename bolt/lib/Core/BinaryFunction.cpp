@@ -4745,18 +4745,6 @@ BinaryFunction::translateInputToOutputRange(DebugAddressRange InRange) const {
       OutHighPC = translateBlockOffset(InputEndOffset - BB.getOffset());
     }
 
-    // A boundary can denote the end of the preceding instruction as well as
-    // the start of the next input block. These may be separated by synthetic
-    // branches or reordering, so prefer a recorded instruction end for ranges.
-    if (BC.hasIOAddressMap()) {
-      const uint64_t EndAddress =
-          getAddress() + std::min(InputEndOffset, uint64_t(BB.getEndOffset()));
-      if (std::optional<uint64_t> End =
-              BC.getIOAddressMap().lookupInstructionEnd(EndAddress))
-        if (*End >= OutLowPC && *End <= BB.getOutputEndAddress())
-          OutHighPC = *End;
-    }
-
     // Check if we can expand the last translated range.
     if (!OutRanges.empty() && OutRanges.back().HighPC == OutLowPC)
       OutRanges.back().HighPC = std::max(OutRanges.back().HighPC, OutHighPC);

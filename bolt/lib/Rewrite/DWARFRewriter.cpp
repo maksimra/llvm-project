@@ -1330,14 +1330,6 @@ void DWARFRewriter::updateUnitDebugInfo(
           UpdatedAddress =
               Function->translateInputToOutputAddress(UpdatedAddress);
 
-        // A return PC is an instruction end, which can precede a newly emitted
-        // branch even when its input address also names the next basic block.
-        if (AttrVal.getAttribute() == dwarf::DW_AT_call_return_pc &&
-            BC.hasIOAddressMap())
-          if (std::optional<uint64_t> End =
-                  BC.getIOAddressMap().lookupInstructionEnd(*Address))
-            UpdatedAddress = *End;
-
         if (AttrVal.getForm() == dwarf::DW_FORM_addrx) {
           const uint32_t Index =
               AddressWriter.getIndexFromAddress(UpdatedAddress, Unit);

@@ -20,12 +20,18 @@ when near fits the short encoding. A failed reuse or pair choice is rechecked
 and falls back to inline expansion. Unrecognized expressions retain their full
 operand and cannot use sharing or local range proofs.
 
-The old pass splits BBs before CFI finalization. The late version instead leaves
-original instructions and their PC/CFI labels in place. Reuse requires no CFI
-change between source and trampoline. End trampolines save source rows and
-restore them in reverse source order; GNU_args_size is emitted explicitly.
+When updating debug info, synthetic terminal Bs with local successors are split
+into separate BBs before planning. Instructions and trailing CFIs keep their
+emission order; alignment stays on the original BB. Lowered tail calls,
+non-simple functions and patches are left alone. Reuse requires no CFI change
+between source and trampoline. End trampolines save source rows and restore them in reverse source
+order; GNU_args_size is emitted explicitly.
 Opaque CFI and differing unwind rows at a fall-through continuation disable
 outlining. Fixed-footprint patches cannot acquire extra instructions.
+
+Synthetic branch BBs have no input range. Existing debug-range translation can
+therefore stop at the original BB's end, excluding the added B without a
+separate instruction-end address map.
 
 InstructionLowering preserves successor vectors and counts but removes tail-call
 annotations. Cold-edge decisions therefore require a valid function profile,
@@ -67,3 +73,9 @@ Historical emitter/LongJmp variants use common supporting libraries. These are
 synthetic measurements, not a repeat of the supplied Clang/TU benchmark.
 Commands, raw timings and validation logs are in `/tmp/bolt-local-transfer`.
 `git diff --check` passes.
+
+The variant that splits synthetic branch BBs and removes instruction-end maps
+passes 26 selected lit tests and 67 CoreTests (33 architecture skips). DWARF 4/5,
+CFI, LSDA, BAT and function symbols match between one- and four-thread runs.
+The updated checks also cover a conditional/B pair split across adjacent BBs.
+Logs and comparison scripts are in `/tmp/bolt-split-branches`.

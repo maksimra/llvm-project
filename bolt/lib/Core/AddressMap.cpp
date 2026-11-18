@@ -17,7 +17,6 @@ namespace llvm {
 namespace bolt {
 
 const char *const AddressMap::AddressSectionName = ".bolt.addr2addr_map";
-const char *const AddressMap::InstructionEndSectionName = ".bolt.inst_end_map";
 const char *const AddressMap::LabelSectionName = ".bolt.label2addr_map";
 
 static void emitAddress(MCStreamer &Streamer, uint64_t InputAddress,
@@ -31,25 +30,12 @@ static void emitLabel(MCStreamer &Streamer, const MCSymbol *OutputLabel) {
   Streamer.emitSymbolValue(OutputLabel, 8);
 }
 
-void AddressMap::emitInstructionEnd(MCStreamer &Streamer, BinaryContext &BC,
-                                    uint64_t InputEndAddress) {
-  MCSymbol *End = BC.Ctx->createTempSymbol();
-  Streamer.emitLabel(End);
-  Streamer.pushSection();
-  Streamer.switchSection(BC.getDataSection(InstructionEndSectionName));
-  emitAddress(Streamer, InputEndAddress, End);
-  Streamer.popSection();
-}
-
 void AddressMap::emit(MCStreamer &Streamer, BinaryContext &BC) {
   // Mark map sections as link-only to avoid allocation in the output file.
   const unsigned Flags = BinarySection::getFlags(/*IsReadOnly*/ true,
                                                  /*IsText*/ false,
                                                  /*IsAllocatable*/ true);
   BC.registerOrUpdateSection(AddressSectionName, ELF::SHT_PROGBITS, Flags)
-      .setLinkOnly();
-  BC.registerOrUpdateSection(InstructionEndSectionName, ELF::SHT_PROGBITS,
-                             Flags)
       .setLinkOnly();
   BC.registerOrUpdateSection(LabelSectionName, ELF::SHT_PROGBITS, Flags)
       .setLinkOnly();
@@ -77,11 +63,9 @@ void AddressMap::emit(MCStreamer &Streamer, BinaryContext &BC) {
 
 std::optional<AddressMap> AddressMap::parse(BinaryContext &BC) {
   auto AddressMapSection = BC.getUniqueSectionByName(AddressSectionName);
-  auto InstructionEndSection =
-      BC.getUniqueSectionByName(InstructionEndSectionName);
   auto LabelMapSection = BC.getUniqueSectionByName(LabelSectionName);
 
-  if (!AddressMapSection && !InstructionEndSection && !LabelMapSection)
+  if (!AddressMapSection && !LabelMapSection)
     return std::nullopt;
 
   AddressMap Parsed;
@@ -124,15 +108,6 @@ std::optional<AddressMap> AddressMap::parse(BinaryContext &BC) {
              "Duplicate label entry detected.");
       Parsed.Label2AddrMap.insert(
           {reinterpret_cast<const MCSymbol *>(Input), Output});
-    });
-  }
-
-  if (InstructionEndSection) {
-    Parsed.InstructionEndMap.reserve(InstructionEndSection->getOutputSize() /
-                                     EntrySize);
-    parseSection(*InstructionEndSection, [&](uint64_t Input, uint64_t Output) {
-      if (!Parsed.InstructionEndMap.count(Input))
-        Parsed.InstructionEndMap.insert({Input, Output});
     });
   }
 

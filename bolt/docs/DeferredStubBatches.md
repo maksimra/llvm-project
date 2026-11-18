@@ -107,9 +107,11 @@ end trampoline for a cold taken edge, otherwise expand inline. Exact MC block
 alignment and function prefixes are included in every iteration. A reversible
 `B.cond far; B near` pair uses `B.!cond near; B far` when near is reachable.
 
-Unlike the earlier CFG pass, emission leaves original instructions, CFI and PC
-labels in place. Reuse requires matching CFI epochs. End trampolines remember
-source rows and restore them in reverse source order, including PAC state and
+When updating debug info, synthetic terminal Bs with local successors are split
+into separate BBs before planning, preserving instruction/CFI order and original
+BB alignment.
+Reuse requires no CFI change between source and trampoline. End trampolines
+remember source rows and restore them in reverse source order, including PAC state and
 explicit GNU_args_size. Opaque CFI disables outlining; fall-through continuations
 also require matching source/end rows. Non-simple functions retain their layout;
 fixed-size patches cannot grow. Cold-edge evidence requires a valid profile and
@@ -118,11 +120,9 @@ a matching successor, rather than normalized zero counts without profile.
 See [the local-relaxation notes](DeferredLocalBranchRelaxation.md) for validation
 and the interpretation of the supplied Clang measurements.
 
-With `--update-debug-sections`, emission also records instruction ends separately
-from instruction starts. An input boundary can be both a call's return PC and a
-successor block's entry, which need not be adjacent in the output. Range and
-location-list ends and `DW_AT_call_return_pc` use the former mapping so they do
-not accidentally include a synthetic branch or point at a reordered successor.
+Synthetic branch BBs have no input range. Existing debug-range and location-list
+translation uses the original BB's end to exclude these branches; no additional
+instruction-end mapping or temporary section is needed.
 
 ## Existing per-function sections
 

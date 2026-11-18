@@ -124,8 +124,48 @@ bool fragmentMayFallThrough(const FunctionFragment &Fragment,
   return false;
 }
 
-/// The fragment-local algorithm from LongJmpPass::relaxLocalBranches, applied
-/// at emission without splitting finalized BBs or moving their CFI/PC labels.
+/// Give synthetic terminal Bs their own BB so input debug ranges end before
+/// them. Keep instruction/CFI order and block alignment unchanged.
+void splitSyntheticBranches(BinaryFunction &BF) {
+  if (!opts::UpdateDebugSections || !BF.isSimple() || BF.isPatch())
+    return;
+
+  BinaryContext &BC = BF.getBinaryContext();
+  for (BinaryBasicBlock *BB : llvm::to_vector(BF.getLayout().blocks())) {
+    MCInst *B = BB->getLastNonPseudoInstr();
+    if (!B || BB->getInputOffset() == BinaryBasicBlock::INVALID_OFFSET ||
+        !BC.MII->get(B->getOpcode()).isUnconditionalBranch() ||
+        BC.MIB->getOffset(*B))
+      continue;
+
+    BinaryBasicBlock::BinaryBranchInfo Edge;
+    BinaryBasicBlock *Target =
+        BB->getSuccessor(BC.MIB->getTargetSymbol(*B), Edge);
+    // Lowered tail calls are also Bs, but have no local successor.
+    if (!Target)
+      continue;
+
+    auto BranchBB = BF.createBasicBlock();
+    BranchBB->setFragmentNum(BB->getFragmentNum());
+    BranchBB->setExecutionCount(Edge.Count);
+    BranchBB->addSuccessor(Target, Edge.Count, Edge.MispredictedCount);
+    BranchBB->addInstruction(*B);
+    BranchBB->addInstructions(BB->splitInstructions(B));
+    BB->eraseInstruction(BB->findInstruction(B));
+    BB->replaceSuccessor(Target, BranchBB.get(), Edge.Count,
+                         /*MispredictedCount=*/0);
+
+    std::vector<std::unique_ptr<BinaryBasicBlock>> Blocks;
+    Blocks.push_back(std::move(BranchBB));
+    BF.insertBasicBlocks(BB, std::move(Blocks), /*UpdateLayout=*/true,
+                         /*UpdateCFIState=*/true,
+                         /*RecomputeLandingPads=*/false);
+  }
+}
+
+/// Select branch encodings for one finalized AArch64 fragment.
+/// run() reads the layout, instructions and saved edge counts.
+/// prepare() and emit*() write the selected forms without editing basic blocks.
 class LocalBranchRelaxation {
   BinaryContext &BC;
   using Target = std::pair<const MCSymbol *, int64_t>;
@@ -333,26 +373,39 @@ public:
               continue;
             }
           }
-          // B.cond far; B near can use a short inversion without growth.
+          // B.cond far; B near -> B.!cond near; B far, with no added bytes.
+          // Both instructions must have the same CFI row; preserve flags.
           const auto I = BB->begin() + (&Inst - &*BB->begin());
-          const auto Next =
+          const auto NextIt =
               std::find_if(std::next(I), BB->end(), [&](const MCInst &M) {
                 return !BC.MIB->isPseudo(M);
               });
+          const MCInst *Next = NextIt == BB->end() ? nullptr : &*NextIt;
+          // Splitting a synthetic B preserves this pair across adjacent BBs.
+          if (!Next) {
+            const BinaryBasicBlock *NextBB =
+                BF.getLayout().getBasicBlockAfter(BB, /*IgnoreSplits=*/false);
+            if (NextBB &&
+                NextBB->getInputOffset() == BinaryBasicBlock::INVALID_OFFSET &&
+                NextBB->getNumNonPseudos() == 1 &&
+                NextBB->pred_size() == 1 && *NextBB->pred_begin() == BB)
+              Next = NextBB->getLastNonPseudoInstr();
+          }
           if (!PreserveLayout && BC.MIB->isReversibleBranch(Inst) &&
-              Next != BB->end() && CFI.lookup(&*Next) == CFI.lookup(&Inst) &&
+              Next && CFI.lookup(Next) == CFI.lookup(&Inst) &&
               BC.MII->get(Next->getOpcode()).isUnconditionalBranch()) {
-            const Target N = target(*Next);
-            const auto *NearBB = BF.getBasicBlockForLabel(N.first);
+            const Target NearTarget = target(*Next);
+            const auto *NearBB = BF.getBasicBlockForLabel(NearTarget.first);
             if (NearBB && Blocks.count(NearBB) &&
-                reaches(Blocks.lookup(NearBB), N.second)) {
-              Swaps[&Inst] = &*Next;
-              SwapJumps[&*Next] = &Inst;
+                reaches(Blocks.lookup(NearBB), NearTarget.second)) {
+              Swaps[&Inst] = Next;
+              SwapJumps[Next] = &Inst;
               Changed = true;
               continue;
             }
           }
         }
+
         if (PreserveLayout) {
           Error = &Inst;
           return;
@@ -621,6 +674,7 @@ void BinaryEmitter::relaxLocalBranches() {
     BodyOffsets[BF] = Offset;
     if (BF->isSplit() && BF->hasConstantIsland())
       BF->duplicateConstantIslands();
+    splitSyntheticBranches(*BF);
     for (FunctionFragment &FF : BF->getLayout().fragments())
       if (!FF.isSplitFragment() || !FF.empty() || BF->hasConstantIsland())
         Relaxations[&FF] = std::make_unique<LocalBranchRelaxation>(BC);
@@ -986,10 +1040,6 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
       }
       if (!Relaxed)
         Streamer.emitInstruction(Instr, *BC.STI);
-      if (useFragmentSections(BC) && !EmitCodeOnly && opts::UpdateDebugSections)
-        if (std::optional<uint32_t> Offset = BC.MIB->getOffset(Instr))
-          AddressMap::emitInstructionEnd(Streamer, BC,
-                                         BF.getAddress() + *Offset + 4);
     }
   }
 

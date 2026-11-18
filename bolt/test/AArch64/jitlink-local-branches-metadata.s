@@ -47,10 +47,12 @@
 # CHECK: DW_TAG_subprogram
 # CHECK: DW_AT_low_pc (0x{{0*}}[[#START]])
 # CHECK: DW_AT_high_pc (0x{{0*}}[[#TAKEN + 8]])
+## Splitting the synthetic fall-through B into its own BB keeps the call's
+## input range from including that branch, without an instruction-end map.
 # CHECK: DW_TAG_variable
+# CHECK: [0x{{0*}}[[#START]], 0x{{0*}}[[#FALL]]): DW_OP_reg8 W8
 # CHECK: [0x{{0*}}[[#CALL]], 0x{{0*}}[[#CALL + 4]]): DW_OP_reg8 W8
-# CHECK: DW_TAG_call_site
-# CHECK: DW_AT_call_return_pc (0x{{0*}}[[#CALL + 4]])
+# CHECK-NEXT: [0x{{0*}}[[#TAKEN]], 0x{{0*}}[[#TAKEN + 4]]): DW_OP_reg8 W8
 
 ## Both added branches inherit the CFA and signed-RA state of the TBZ. The
 ## epilogue and landing pad retain their own rules at their shifted addresses.
@@ -173,9 +175,6 @@ personality:
   .byte 3, 8
   .byte 2, 23
   .byte 0, 0
-  .byte 4, 72, 0
-  .byte 125, 1
-  .byte 0, 0
   .byte 0
 
 .section .debug_info,"",@progbits
@@ -204,8 +203,6 @@ personality:
   .byte 3
   .asciz "x"
   .long .Lloc
-  .byte 4
-  .quad .Lcallend
   .byte 0
   .byte 0
 .LDIEEnd:
