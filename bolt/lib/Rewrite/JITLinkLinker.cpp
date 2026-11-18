@@ -238,7 +238,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
                 G, Linker.BC.EmittedFragmentSections, FragmentsByBlock))
           return Err;
         auto Stubs =
-            reserveAArch64Stubs(G, FragmentsByBlock, &Linker.BC.outs());
+            reserveAArch64Stubs(G, FragmentsByBlock);
         if (!Stubs)
           return Stubs.takeError();
         StubRecords = std::move(*Stubs);
