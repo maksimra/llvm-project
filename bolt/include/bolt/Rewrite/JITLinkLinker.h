@@ -49,7 +49,13 @@ public:
 
   struct AArch64Branch {
     jitlink::Block *SourceBlock;
-    jitlink::Edge::OffsetT SourceOffset;
+    // Source edges are not reordered after reservation. Materialization only
+    // appends edges to separate stub island blocks.
+    size_t EdgeIndex;
+
+    jitlink::Edge &getEdge() const {
+      return SourceBlock->edges().begin()[EdgeIndex];
+    }
   };
   struct AArch64Stub {
     jitlink::Symbol *SlotSym;

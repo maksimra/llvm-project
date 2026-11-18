@@ -37,6 +37,8 @@
 ## A zero-count taken edge to another fragment keeps its original polarity
 ## and hot fall-through. The outlined B must use the source's CFA/signed-RA
 ## row, even though the hot epilogue restores both before the fragment ends.
+## GNU_args_size is not restored by restore_state and must be emitted explicitly.
+## dwarfdump currently prints this GNU opcode without a name on AArch64.
 # RUN: llvm-mc -filetype=obj -triple=aarch64-unknown-linux -mattr=+pauth \
 # RUN:   %t/cold.s -o %t.cold.o
 # RUN: ld.lld --emit-relocs -e cold %t.cold.o -o %t.cold
@@ -60,6 +62,15 @@
 # COLD-NEXT: {{0*}}[[#THUNK2]]: b {{.*}} <cold.cold.0{{.*}}>
 # COLD-NEXT: {{0*}}[[#THUNK]]: b {{.*}} <cold.cold.0>
 # COLD: FDE cie={{.*}} pc={{0*}}[[#START]]...{{0*}}[[#THUNK + 4]]
+# COLD: {{^ *(DW_CFA_GNU_args_size)?}}: +16
+# COLD: DW_CFA_remember_state:
+# COLD: {{^ *(DW_CFA_GNU_args_size)?}}: +32
+# COLD: DW_CFA_remember_state:
+# COLD: {{^ *(DW_CFA_GNU_args_size)?}}: +0
+# COLD: DW_CFA_restore_state:
+# COLD-NEXT: {{^ *(DW_CFA_GNU_args_size)?}}: +32
+# COLD: DW_CFA_restore_state:
+# COLD-NEXT: {{^ *(DW_CFA_GNU_args_size)?}}: +16
 # COLD: 0x[[#START + 8]]: CFA=WSP+16: reg34=1
 # COLD: 0x[[#START + 16]]: CFA=WSP+32: reg34=1
 # COLD: 0x[[#START + 24]]: CFA=WSP: reg34=1
@@ -174,6 +185,7 @@ cold:
 .cfi_negate_ra_state
   sub sp, sp, #16
 .cfi_def_cfa_offset 16
+.cfi_escape 0x2e, 16
 .branch:
 # FDATA: 1 cold #.branch# 1 cold #.taken# 0 0
 # FDATA: 1 cold #.branch# 1 cold #.hot# 0 100
@@ -181,6 +193,7 @@ cold:
 .hot:
   sub sp, sp, #16
 .cfi_def_cfa_offset 32
+.cfi_escape 0x2e, 32
 .branch2:
 # FDATA: 1 cold #.branch2# 1 cold #.taken2# 0 0
 # FDATA: 1 cold #.branch2# 1 cold #.hot2# 0 100
@@ -188,11 +201,13 @@ cold:
 .hot2:
   add sp, sp, #32
 .cfi_def_cfa_offset 0
+.cfi_escape 0x2e, 0
   autiasp
 .cfi_negate_ra_state
   ret
 .taken:
 .cfi_def_cfa_offset 16
+.cfi_escape 0x2e, 16
 .cfi_negate_ra_state
   .rept 20
   mov x0, #42
@@ -204,6 +219,7 @@ cold:
   ret
 .taken2:
 .cfi_def_cfa_offset 32
+.cfi_escape 0x2e, 32
 .cfi_negate_ra_state
   .rept 20
   mov x0, #43

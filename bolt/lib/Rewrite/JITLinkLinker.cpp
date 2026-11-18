@@ -222,8 +222,7 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
         if (Error Err = mergeFragmentSections(
                 G, Linker.BC.EmittedFragmentSections, FragmentsByBlock))
           return Err;
-        auto Stubs =
-            reserveAArch64Stubs(G, FragmentsByBlock);
+        auto Stubs = reserveAArch64Stubs(G, FragmentsByBlock);
         if (!Stubs)
           return Stubs.takeError();
         StubRecords = std::move(*Stubs);
@@ -280,60 +279,58 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
     DenseMap<uint64_t, SmallVector<jitlink::Symbol *, 1>> MaterializedStubs;
     for (auto &Record : StubRecords) {
       for (const auto &Branch : Record.Branches) {
-        for (jitlink::Edge &Edge :
-             Branch.SourceBlock->edges_at(Branch.SourceOffset)) {
-          if (Edge.getKind() != jitlink::aarch64::Branch26PCRel)
-            continue;
+        jitlink::Edge &Edge = Branch.getEdge();
+        assert(Edge.getKind() == jitlink::aarch64::Branch26PCRel &&
+               "Reserved branch edge changed after placement");
 
-          const auto SourceAddress = Branch.SourceBlock->getFixupAddress(Edge);
-          const auto TargetAddress =
-              Edge.getTarget().getAddress() + Edge.getAddend();
-          const int64_t Displacement = TargetAddress - SourceAddress;
-          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: edge for "
-                            << (Edge.getTarget().hasName()
-                                    ? *Edge.getTarget().getName()
-                                    : "<anonymous>")
-                            << " has " << formatSignedHex(Displacement)
-                            << " displacement.\n");
+        const auto SourceAddress = Branch.SourceBlock->getFixupAddress(Edge);
+        const auto TargetAddress =
+            Edge.getTarget().getAddress() + Edge.getAddend();
+        const int64_t Displacement = TargetAddress - SourceAddress;
+        LLVM_DEBUG(dbgs() << "BOLT-DEBUG: edge for "
+                          << (Edge.getTarget().hasName()
+                                  ? *Edge.getTarget().getName()
+                                  : "<anonymous>")
+                          << " has " << formatSignedHex(Displacement)
+                          << " displacement.\n");
 
-          if (isInt<28>(Displacement))
-            continue;
+        if (isInt<28>(Displacement))
+          continue;
 
-          auto &Stubs = MaterializedStubs[TargetAddress.getValue()];
-          auto It = llvm::find_if(llvm::reverse(Stubs), [&](const auto *Stub) {
-            return isInt<28>(int64_t(Stub->getAddress() - SourceAddress));
-          });
-          if (It != Stubs.rend()) {
-            Edge.setTarget(**It);
-            Edge.setAddend(0);
-            ++NumSharedStubs;
-            continue;
-          }
-
-          const int64_t SlotDisplacement =
-              Record.SlotSym->getAddress() - SourceAddress;
-          LLVM_DEBUG(dbgs() << "BOLT-DEBUG: that is out of range. And slot "
-                               "displacement is "
-                            << formatSignedHex(SlotDisplacement) << "\n");
-
-          if (!isInt<28>(SlotDisplacement))
-            return make_error<jitlink::JITLinkError>(
-                "Reserved AArch64 branch stub is out of Branch26 range");
-
-          if (Linker.BC.usesBTI() && Stubs.empty())
-            if (Error Err = ensureAArch64BTITarget(Linker.BC, CodeBlocks,
-                                                   TargetAddress.getValue()))
-              return Err;
-
-          if (Error Err = materializeAArch64Stub(
-                  *Record.SlotSym, Edge.getTarget(), Edge.getAddend()))
-            return Err;
-          ++NumShortStubs;
-          Stubs.push_back(Record.SlotSym);
-
-          Edge.setTarget(*Record.SlotSym);
+        auto &Stubs = MaterializedStubs[TargetAddress.getValue()];
+        auto It = llvm::find_if(llvm::reverse(Stubs), [&](const auto *Stub) {
+          return isInt<28>(int64_t(Stub->getAddress() - SourceAddress));
+        });
+        if (It != Stubs.rend()) {
+          Edge.setTarget(**It);
           Edge.setAddend(0);
+          ++NumSharedStubs;
+          continue;
         }
+
+        const int64_t SlotDisplacement =
+            Record.SlotSym->getAddress() - SourceAddress;
+        LLVM_DEBUG(dbgs() << "BOLT-DEBUG: that is out of range. And slot "
+                             "displacement is "
+                          << formatSignedHex(SlotDisplacement) << "\n");
+
+        if (!isInt<28>(SlotDisplacement))
+          return make_error<jitlink::JITLinkError>(
+              "Reserved AArch64 branch stub is out of Branch26 range");
+
+        if (Linker.BC.usesBTI() && Stubs.empty())
+          if (Error Err = ensureAArch64BTITarget(Linker.BC, CodeBlocks,
+                                                 TargetAddress.getValue()))
+            return Err;
+
+        if (Error Err = materializeAArch64Stub(
+                *Record.SlotSym, Edge.getTarget(), Edge.getAddend()))
+          return Err;
+        ++NumShortStubs;
+        Stubs.push_back(Record.SlotSym);
+
+        Edge.setTarget(*Record.SlotSym);
+        Edge.setAddend(0);
       }
     }
 
@@ -565,8 +562,8 @@ Error validateFragmentEdge(const jitlink::Block &Source,
   return Error::success();
 }
 
-Error validateFragmentEdges(jitlink::LinkGraph &G,
-                            const DenseSet<jitlink::Block *> &FragmentBlocks) {
+Error validateFragmentEdges(
+    jitlink::LinkGraph &G, const JITLinkLinker::FragmentMap &FragmentsByBlock) {
   LLVM_DEBUG(dbgs() << "BOLT-DEBUG: Fragment Edges validation.\n");
 
   // S+A must stay in the original fragment. In particular, a section symbol
@@ -575,7 +572,7 @@ Error validateFragmentEdges(jitlink::LinkGraph &G,
     for (const auto &Edge : Block->edges()) {
       const auto &Target = Edge.getTarget();
       if (!Edge.isRelocation() || !Target.isDefined() ||
-          !FragmentBlocks.contains(&Target.getBlock()))
+          !FragmentsByBlock.contains(&Target.getBlock()))
         continue;
       if (Error Err = validateFragmentEdge(*Block, Edge))
         return Err;
@@ -587,8 +584,7 @@ Error validateFragmentEdges(jitlink::LinkGraph &G,
 Error mergeFragmentSection(jitlink::LinkGraph &G,
                            const EmittedFragmentSection &Fragment,
                            jitlink::Section &Input,
-                           FragmentBlocksBySection &BlocksBySection,
-                           JITLinkLinker::FragmentMap &FragmentsByBlock) {
+                           FragmentBlocksBySection &BlocksBySection) {
   auto *Output = G.findSectionByName(Fragment.OutputSection);
   if (!Output) {
     Output = &G.createSection(Fragment.OutputSection, Input.getMemProt());
@@ -615,7 +611,6 @@ Error mergeFragmentSection(jitlink::LinkGraph &G,
       std::max(Blocks.front()->getAlignment(), Fragment.OutputAlignment));
   if (Fragment.HasFallThrough)
     assert(Block->getSize() >= 4 && "Missing emitted fall-through branch");
-  FragmentsByBlock[Block] = &Fragment;
   G.mergeSections(*Output, Input);
   return Error::success();
 }
@@ -628,8 +623,9 @@ Error JITLinkLinker::mergeFragmentSections(
   LLVM_DEBUG(dbgs() << "BOLT-DEBUG: begin of Fragment Sections merging.\n");
 
   FragmentBlocksBySection BlocksBySection;
-  DenseSet<jitlink::Block *> FragmentBlocks;
   SmallVector<jitlink::Section *> Sections;
+  Sections.reserve(Fragments.size());
+  FragmentsByBlock.reserve(Fragments.size());
   for (const auto &Fragment : Fragments) {
     auto *Section = G.findSectionByName(Fragment.Name);
     if (!Section)
@@ -641,15 +637,15 @@ Error JITLinkLinker::mergeFragmentSections(
       return make_error<jitlink::JITLinkError>(
           "Expected one block in emitted fragment section " + Fragment.Name);
     Sections.push_back(Section);
-    FragmentBlocks.insert(*Section->blocks().begin());
+    FragmentsByBlock[*Section->blocks().begin()] = &Fragment;
   }
 
-  if (Error Err = validateFragmentEdges(G, FragmentBlocks))
+  if (Error Err = validateFragmentEdges(G, FragmentsByBlock))
     return Err;
 
   for (auto [Index, Fragment] : llvm::enumerate(Fragments))
     if (Error Err = mergeFragmentSection(G, Fragment, *Sections[Index],
-                                         BlocksBySection, FragmentsByBlock))
+                                         BlocksBySection))
       return Err;
 
   // Preserve emission order only. Byte placement happens in the linker.
@@ -867,7 +863,8 @@ private:
                                                  AArch64StubSize, true, true),
                            {}});
         }
-        Stubs[It->second].Branches.push_back({Block, Edge->getOffset()});
+        Stubs[It->second].Branches.push_back(
+            {Block, size_t(Edge - &*Block->edges().begin())});
       }
     }
     if (Island) {

@@ -109,10 +109,12 @@ protected:
   void checkReachability(ArrayRef<JITLinkLinker::AArch64Stub> Stubs) {
     for (const auto &Stub : Stubs) {
       EXPECT_EQ(Stub.SlotSym->getSize(), 12u);
-      for (const auto &Branch : Stub.Branches)
+      for (const auto &Branch : Stub.Branches) {
+        EXPECT_EQ(Branch.getEdge().getKind(), aarch64::Branch26PCRel);
         EXPECT_TRUE(isInt<28>(
             int64_t(Stub.SlotSym->getAddress() -
-                    (Branch.SourceBlock->getAddress() + Branch.SourceOffset))));
+                    Branch.SourceBlock->getFixupAddress(Branch.getEdge()))));
+      }
     }
   }
 };
@@ -154,6 +156,8 @@ TEST_F(AArch64StubBatchTest, UnorderedEdgesRetainReachableBackwardSlot) {
   auto &Large = block(200 * MiB);
   // Relocation order need not match instruction order. The late call needs
   // a new slot, while the early call can still reach the previous island.
+  // Non-branch relocations also occupy entries in the source edge vector.
+  Large.addEdge(aarch64::Pointer64, 8, Far, 0);
   branch(Large, 200 * MiB - 4, Far);
   branch(Large, 0, Far);
   auto Stubs = reserve();
@@ -161,6 +165,8 @@ TEST_F(AArch64StubBatchTest, UnorderedEdgesRetainReachableBackwardSlot) {
   ASSERT_EQ(Stubs->size(), 2u);
   EXPECT_EQ((*Stubs)[0].Branches.size(), 2u);
   EXPECT_EQ((*Stubs)[1].Branches.size(), 1u);
+  EXPECT_EQ((*Stubs)[0].Branches.back().getEdge().getOffset(), 0u);
+  EXPECT_EQ((*Stubs)[1].Branches.front().getEdge().getOffset(), 200 * MiB - 4);
   checkReachability(*Stubs);
 }
 
