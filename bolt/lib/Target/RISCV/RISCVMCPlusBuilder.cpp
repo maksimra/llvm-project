@@ -236,7 +236,8 @@ public:
                          bool MustPreserveFlags = true) const override {
     auto Opcode = getInvertedBranchOpcode(Inst.getOpcode());
     Inst.setOpcode(Opcode);
-    replaceBranchTarget(Inst, TBB, Ctx);
+    if (TBB)
+      replaceBranchTarget(Inst, TBB, Ctx);
     return {Inst};
   }
 

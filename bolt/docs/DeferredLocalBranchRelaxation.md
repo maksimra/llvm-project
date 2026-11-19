@@ -19,6 +19,22 @@ Source branches and CFI are collected once before the iteration loop. Inline
 growth recomputes only byte offsets; branch forms and trampoline reuse are
 rechecked on every iteration.
 
+`layoutFunctionFragment` is the common block/instruction walk used by local
+relaxation and `emitFunctionBody`. It applies alignment budgets and emits the
+selected instruction sequences. Without a streamer, it computes their exact
+sizes from the target descriptors; callbacks only observe positions, collect
+branch/CFI information, or emit metadata. There is no separate block-size
+callback, instruction-size model or saved padding map. Final emission repeats
+the same walk and writes fixed NOP padding, preserving section alignment even
+when the budget skips padding. Other emission modes retain MC alignment and
+relaxation.
+
+Inline and end-trampoline offsets use the same instruction-selection routines
+as emission, including the flags-preserving irreversible CMPBR sequence and
+the fall-through guard. Context-free branch inversion preserves the target
+operand, and workers copy a prebuilt unconditional branch, so neither operation
+allocates expressions or symbols in the shared MCContext.
+
 The conditional/B pair optimization additionally uses `B.!cond near; B far`
 when near fits the short encoding. A failed reuse or pair choice is rechecked
 and falls back to inline expansion. Targets use the existing MCPlusBuilder
@@ -83,3 +99,13 @@ passes 26 selected lit tests and 67 CoreTests (33 architecture skips). DWARF 4/5
 CFI, LSDA, BAT and function symbols match between one- and four-thread runs.
 The updated checks also cover a conditional/B pair split across adjacent BBs.
 Logs and comparison scripts are in `/tmp/bolt-split-branches`.
+
+The shared instruction walk passes 69 CoreTests (35 architecture skips) and
+24 selected AArch64/X86 lit tests. The new object-emission regression covers
+8/12-byte expansion, a second relaxation iteration, CFI pseudos, empty aligned
+blocks and bounded/unlimited padding. Fourteen outputs match the previous
+emitter's code, unwind/exception tables, debug sections and function symbols;
+DWARF 4/5, CFI, LSDA and BAT also match between one and four threads.
+Changed translation units were rebuilt and linked against the existing LLVM
+and unchanged BOLT support libraries. Logs and reproduction scripts are in
+`/tmp/bolt-unified-emission-20261124`.

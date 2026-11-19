@@ -2839,8 +2839,9 @@ public:
     unsigned InvCC = getInvertedCondCode(getCondCode(Inst));
     assert(InvCC != X86::COND_INVALID && "invalid branch instruction");
     Inst.getOperand(Info->get(Inst.getOpcode()).NumOperands - 1).setImm(InvCC);
-    Inst.getOperand(0) =
-        MCOperand::createExpr(MCSymbolRefExpr::create(TBB, *Ctx));
+    if (TBB)
+      Inst.getOperand(0) =
+          MCOperand::createExpr(MCSymbolRefExpr::create(TBB, *Ctx));
     return {Inst};
   }
 

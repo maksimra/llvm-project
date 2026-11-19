@@ -200,6 +200,160 @@ TEST_P(MCPlusBuilderTester, DeferredInjectedBranchAddend) {
   EXPECT_TRUE(FoundRelocation);
 }
 
+TEST_P(MCPlusBuilderTester, DeferredBlockLayout) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const bool OldDeferred = opts::DoNotUseStubs;
+  scope_exit Restore([&] { opts::DoNotUseStubs = OldDeferred; });
+  opts::DoNotUseStubs = true;
+  BC->HasRelocations = true;
+  BC->AlignText = 4;
+  BC->AlignBlocks = true;
+
+  BinaryFunctionListType Functions;
+  for (unsigned Budget : {0, 4}) {
+    BinaryFunction *BF =
+        BC->createInjectedBinaryFunction(Budget ? "bounded" : "unlimited");
+    BinaryBasicBlock *Entry = BF->addBasicBlock();
+    BinaryBasicBlock *Target = BF->addBasicBlock();
+    Entry->addInstruction(
+        MCInstBuilder(AArch64::TBZW)
+            .addReg(AArch64::W0)
+            .addImm(0)
+            .addExpr(MCSymbolRefExpr::create(Target->getLabel(), *BC->Ctx)));
+    Entry->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+    Entry->addSuccessor(Target);
+    Target->setAlignment(32);
+    Target->setAlignmentMaxBytes(Budget);
+    Target->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+    Functions.push_back(BF);
+  }
+  BC->updateOutputBinaryFunctions(std::move(Functions));
+
+  SmallString<0> Buffer;
+  raw_svector_ostream OS(Buffer);
+  auto Streamer = BC->createStreamer(OS);
+  emitBinaryContext(*Streamer, *BC, "", /*RelaxBranches=*/true);
+  Streamer->finish();
+  ASSERT_FALSE(BC->Ctx->hadError());
+  auto Object = cantFail(ObjectFile::createObjectFile(
+      MemoryBufferRef(Buffer, "emitted fragment layout")));
+  unsigned Found = 0;
+  for (const SectionRef &Section : Object->sections()) {
+    const StringRef Name = cantFail(Section.getName());
+    if (Name != ".bolt.fragment.0" && Name != ".bolt.fragment.1")
+      continue;
+    ++Found;
+    const bool Bounded = Name == ".bolt.fragment.1";
+    const uint64_t TargetOffset = Bounded ? 8 : 32;
+    const StringRef Code = cantFail(Section.getContents());
+    ASSERT_EQ(Code.size(), TargetOffset + 4);
+    // A skipped alignment still constrains placement of the whole fragment.
+    EXPECT_EQ(Section.getAlignment(), 32u);
+    EXPECT_EQ(support::endian::read32le(Code.data()),
+              0x36000000u | ((TargetOffset / 4) << 5));
+    EXPECT_EQ(support::endian::read32le(Code.data() + TargetOffset),
+              0xd65f03c0u);
+    for (uint64_t Offset = 8; Offset < TargetOffset; Offset += 4)
+      EXPECT_EQ(support::endian::read32le(Code.data() + Offset), 0xd503201fu);
+  }
+  EXPECT_EQ(Found, 2u);
+}
+
+// Expansion can absorb alignment padding or cause a bounded alignment to be
+// skipped. In the latter case another branch crosses its range limit on the
+// next iteration. Check the final bytes, including alignment on an empty BB.
+TEST_P(MCPlusBuilderTester, DeferredBlockLayoutAfterExpansion) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const bool OldDeferred = opts::DoNotUseStubs;
+  scope_exit Restore([&] { opts::DoNotUseStubs = OldDeferred; });
+  opts::DoNotUseStubs = true;
+  BC->HasRelocations = true;
+  BC->AlignText = 4;
+  BC->AlignBlocks = true;
+
+  BinaryFunctionListType Functions;
+  for (bool Reversible : {true, false}) {
+    for (unsigned Budget : {0, 4}) {
+      BinaryFunction *BF = BC->createInjectedBinaryFunction(
+          "expansion" + std::to_string(Functions.size()));
+      BinaryBasicBlock *Entry = BF->addBasicBlock();
+      BinaryBasicBlock *Empty = BF->addBasicBlock();
+      BinaryBasicBlock *Target = BF->addBasicBlock();
+      Empty->setAlignment(32);
+      Empty->setAlignmentMaxBytes(Budget);
+      Entry->addInstruction(MCInstBuilder(AArch64::HINT).addImm(0));
+      Entry->addInstruction(
+          MCInstBuilder(AArch64::CBGTXri)
+              .addReg(AArch64::X0)
+              .addImm(0)
+              .addExpr(MCSymbolRefExpr::create(Target->getLabel(), *BC->Ctx)));
+      BF->addCFIInstruction(Entry, Entry->end(),
+                            MCCFIInstruction::cfiDefCfaOffset(nullptr, 16));
+      Entry->addInstruction(
+          MCInstBuilder(AArch64::CBGTXri)
+              .addReg(AArch64::X1)
+              .addImm(Reversible ? 0 : 63)
+              .addExpr(MCSymbolRefExpr::create(
+                  BC->Ctx->getOrCreateSymbol("external"), *BC->Ctx)));
+      for (unsigned I = 0; I != 252; ++I)
+        Entry->addInstruction(MCInstBuilder(AArch64::HINT).addImm(0));
+      Target->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+      Functions.push_back(BF);
+    }
+  }
+  BC->updateOutputBinaryFunctions(std::move(Functions));
+
+  SmallString<0> Buffer;
+  raw_svector_ostream OS(Buffer);
+  auto Streamer = BC->createStreamer(OS);
+  emitBinaryContext(*Streamer, *BC, "", /*RelaxBranches=*/true);
+  Streamer->finish();
+  ASSERT_FALSE(BC->Ctx->hadError());
+  auto Object = cantFail(ObjectFile::createObjectFile(
+      MemoryBufferRef(Buffer, "emitted expanded layout")));
+  unsigned Found = 0;
+  for (const SectionRef &Section : Object->sections()) {
+    StringRef Name = cantFail(Section.getName());
+    if (!Name.consume_front(".bolt.fragment."))
+      continue;
+    unsigned Index;
+    ASSERT_FALSE(Name.getAsInteger(10, Index));
+    ASSERT_LT(Index, 4u);
+    ++Found;
+    const bool Reversible = Index < 2;
+    const bool Bounded = Index % 2;
+    const uint64_t TargetOffset = Reversible ? 1024 : Bounded ? 1032 : 1056;
+    const StringRef Code = cantFail(Section.getContents());
+    ASSERT_EQ(Code.size(), TargetOffset + 4);
+    EXPECT_EQ(Section.getAlignment(), 32u);
+    auto Word = [&](uint64_t Offset) {
+      return support::endian::read32le(Code.data() + Offset);
+    };
+    if (Reversible) {
+      // The four extra bytes consume the original four bytes of padding.
+      // cbgt x0, #0, target; cblt x1, #1, .+8; b external
+      EXPECT_EQ(Word(4), 0xf5001fe0u);
+      EXPECT_EQ(Word(8), 0xf5208041u);
+      EXPECT_EQ(Word(12), 0x14000000u);
+    } else {
+      // Both branches expand, preserving flags at the irreversible CMPBR.
+      // cblt x0, #1, .+8; b target; cbgt x1, #63, .+8; b .+8; b external
+      EXPECT_EQ(Word(4), 0xf5208040u);
+      EXPECT_EQ(Word(8), 0x14000000u | ((TargetOffset - 8) / 4));
+      EXPECT_EQ(Word(12), 0xf51f8041u);
+      EXPECT_EQ(Word(16), 0x14000002u);
+      EXPECT_EQ(Word(20), 0x14000000u);
+    }
+    for (uint64_t Offset = Reversible ? 16 : 24; Offset < TargetOffset;
+         Offset += 4)
+      EXPECT_EQ(Word(Offset), 0xd503201fu);
+    EXPECT_EQ(Word(TargetOffset), 0xd65f03c0u);
+  }
+  EXPECT_EQ(Found, 4u);
+}
+
 TEST_P(MCPlusBuilderTester, DeferredPatchCannotGrow) {
   if (GetParam() != Triple::aarch64)
     GTEST_SKIP();
@@ -360,11 +514,13 @@ TEST_P(MCPlusBuilderTester, AArch64_ReverseCompAndBranch) {
                            .addExpr(MCSymbolRefExpr::create(
                                TargetBB->getLabel(), *BC->Ctx.get()));
   ASSERT_TRUE(BC->MIB->isReversibleBranch(NeedsImmInc));
-  auto NeedsImmIncCode = BC->MIB->reverseBranchCondition(
-      NeedsImmInc, TargetBB->getLabel(), BC->Ctx.get());
+  auto NeedsImmIncCode =
+      BC->MIB->reverseBranchCondition(NeedsImmInc, nullptr, nullptr);
   ASSERT_EQ(NeedsImmIncCode.size(), 1u);
   ASSERT_EQ(NeedsImmIncCode[0].getOpcode(), AArch64::CBLTXri);
   ASSERT_EQ(NeedsImmIncCode[0].getOperand(1).getImm(), 1);
+  EXPECT_EQ(NeedsImmIncCode[0].getOperand(2).getExpr(),
+            NeedsImmInc.getOperand(2).getExpr());
 
   // Compare register with immediate and branch.
   // Inversion requires decrementing the immediate value.
@@ -472,8 +628,8 @@ TEST_P(MCPlusBuilderTester, AArch64_ReverseCompAndBranch_Underflows) {
                                   .addExpr(MCSymbolRefExpr::create(
                                       TargetBB->getLabel(), *BC->Ctx.get())));
   ASSERT_TRUE(BC->MIB->isReversibleBranch(*I, /*PreserveFlags=*/false));
-  auto Code = BC->MIB->reverseBranchCondition(
-      *I, TargetBB->getLabel(), BC->Ctx.get(), /*PreserveFlags=*/false);
+  auto Code = BC->MIB->reverseBranchCondition(*I, nullptr, nullptr,
+                                              /*PreserveFlags=*/false);
   ASSERT_EQ(Code.size(), 2u);
   ASSERT_EQ(Code[0].getOpcode(), AArch64::SUBSXri);
   ASSERT_EQ(Code[0].getOperand(0).getReg(), AArch64::XZR);
@@ -482,6 +638,7 @@ TEST_P(MCPlusBuilderTester, AArch64_ReverseCompAndBranch_Underflows) {
   ASSERT_EQ(Code[0].getOperand(3).getImm(), 0);
   ASSERT_EQ(Code[1].getOpcode(), AArch64::Bcc);
   ASSERT_EQ(Code[1].getOperand(0).getImm(), AArch64CC::GE);
+  EXPECT_EQ(Code[1].getOperand(1).getExpr(), I->getOperand(2).getExpr());
 }
 
 TEST_P(MCPlusBuilderTester, AArch64_ReverseCompAndBranch_Overflows) {

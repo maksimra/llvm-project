@@ -2256,7 +2256,10 @@ public:
         Code.emplace_back(std::move(Cmp));
         Code.emplace_back(MCInstBuilder(AArch64::Bcc)
                               .addImm(getInvertedCC(Inst.getOpcode()))
-                              .addExpr(MCSymbolRefExpr::create(TBB, *Ctx)));
+                              .addOperand(Inst.getOperand(
+                                  MCPlus::getNumPrimeOperands(Inst) - 1)));
+        if (TBB)
+          replaceBranchTarget(Code.back(), TBB, Ctx);
         moveAnnotations(std::move(Inst), Code.back());
         return Code;
       }
@@ -2271,7 +2274,8 @@ public:
       LLVM_DEBUG(Inst.dump());
       llvm_unreachable("Unrecognized branch instruction");
     }
-    replaceBranchTarget(Inst, TBB, Ctx);
+    if (TBB)
+      replaceBranchTarget(Inst, TBB, Ctx);
     return {Inst};
   }
 
