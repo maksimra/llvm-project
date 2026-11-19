@@ -152,11 +152,9 @@ TEST_P(MCPlusBuilderTester, DeferredInjectedBranchAddend) {
       MCInstBuilder(AArch64::TBZW)
           .addReg(AArch64::W0)
           .addImm(0)
-          .addExpr(MCBinaryExpr::createSub(
-              MCBinaryExpr::createAdd(
-                  MCSymbolRefExpr::create(External, *BC->Ctx),
-                  MCConstantExpr::create(16, *BC->Ctx), *BC->Ctx),
-              MCConstantExpr::create(4, *BC->Ctx), *BC->Ctx)));
+          .addExpr(MCBinaryExpr::createAdd(
+              MCSymbolRefExpr::create(External, *BC->Ctx),
+              MCConstantExpr::create(12, *BC->Ctx), *BC->Ctx)));
   BB->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
   // Injected functions are absent from the input-address map used by
   // runOnEachFunction, but must still have their fragments planned.

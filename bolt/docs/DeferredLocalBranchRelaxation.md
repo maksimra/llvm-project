@@ -15,10 +15,14 @@ The late algorithm follows `LongJmpPass::relaxLocalBranches`:
 6. Repeat until the selected branches fit, recomputing the full layout only
    after inline growth; otherwise revisit the recorded branch references.
 
+Source branches and CFI are collected once before the iteration loop. Inline
+growth recomputes only byte offsets; branch forms and trampoline reuse are
+rechecked on every iteration.
+
 The conditional/B pair optimization additionally uses `B.!cond near; B far`
 when near fits the short encoding. A failed reuse or pair choice is rechecked
-and falls back to inline expansion. Unrecognized expressions retain their full
-operand and cannot use sharing or local range proofs.
+and falls back to inline expansion. Targets use the existing MCPlusBuilder
+symbol/addend helpers; expansion preserves the original target operand.
 
 When updating debug info, synthetic terminal Bs with local successors are split
 into separate BBs before planning. Instructions and trailing CFIs keep their
