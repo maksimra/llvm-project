@@ -354,6 +354,135 @@ TEST_P(MCPlusBuilderTester, DeferredBlockLayoutAfterExpansion) {
   EXPECT_EQ(Found, 4u);
 }
 
+// A reused B can change destination when its preceding conditional is swapped.
+// Later growth can also invalidate that swap. Both sources must then expand,
+// and the B must regain its original target.
+TEST_P(MCPlusBuilderTester, DeferredBranchFormsRevalidated) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const bool OldDeferred = opts::DoNotUseStubs;
+  scope_exit Restore([&] { opts::DoNotUseStubs = OldDeferred; });
+  opts::DoNotUseStubs = true;
+  BC->HasRelocations = true;
+  BC->AlignText = 4;
+  BinaryFunction *BF = BC->createInjectedBinaryFunction("revalidate");
+  BinaryBasicBlock *Entry = BF->addBasicBlock();
+  BinaryBasicBlock *Pair = BF->addBasicBlock();
+  BinaryBasicBlock *Growing = BF->addBasicBlock();
+  BinaryBasicBlock *Target = BF->addBasicBlock();
+  const MCExpr *Local = MCSymbolRefExpr::create(Target->getLabel(), *BC->Ctx);
+  Entry->addInstruction(MCInstBuilder(AArch64::CBGTXri)
+                            .addReg(AArch64::X2)
+                            .addImm(0)
+                            .addExpr(Local));
+  Pair->addInstruction(MCInstBuilder(AArch64::CBGTXri)
+                           .addReg(AArch64::X0)
+                           .addImm(0)
+                           .addExpr(MCSymbolRefExpr::create(
+                               BC->Ctx->getOrCreateSymbol("far"), *BC->Ctx)));
+  Pair->addInstruction(MCInstBuilder(AArch64::B).addExpr(Local));
+  Growing->addInstruction(
+      MCInstBuilder(AArch64::CBGTXri)
+          .addReg(AArch64::X1)
+          .addImm(63)
+          .addExpr(MCSymbolRefExpr::create(BC->Ctx->getOrCreateSymbol("other"),
+                                           *BC->Ctx)));
+  for (unsigned I = 0; I != 252; ++I)
+    Growing->addInstruction(MCInstBuilder(AArch64::HINT).addImm(0));
+  Target->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+  BC->updateOutputBinaryFunctions({BF});
+
+  SmallString<0> Buffer;
+  raw_svector_ostream OS(Buffer);
+  auto Streamer = BC->createStreamer(OS);
+  emitBinaryContext(*Streamer, *BC, "", /*RelaxBranches=*/true);
+  Streamer->finish();
+  ASSERT_FALSE(BC->Ctx->hadError());
+  auto Object = cantFail(ObjectFile::createObjectFile(
+      MemoryBufferRef(Buffer, "revalidated branch forms")));
+  bool Found = false;
+  for (const SectionRef &Section : Object->sections()) {
+    if (cantFail(Section.getName()) != ".bolt.fragment.0")
+      continue;
+    Found = true;
+    const StringRef Code = cantFail(Section.getContents());
+    ASSERT_EQ(Code.size(), 1044u);
+    auto Word = [&](uint64_t Offset) {
+      return support::endian::read32le(Code.data() + Offset);
+    };
+    EXPECT_EQ(Word(0), 0xf5208042u);    // cblt x2, #1, .+8
+    EXPECT_EQ(Word(4), 0x14000103u);    // b target (1040)
+    EXPECT_EQ(Word(8), 0xf5208040u);    // cblt x0, #1, .+8
+    EXPECT_EQ(Word(12), 0x14000000u);   // b far
+    EXPECT_EQ(Word(16), 0x14000100u);   // b target, original pair destination
+    EXPECT_EQ(Word(20), 0xf51f8041u);   // cbgt x1, #63, .+8
+    EXPECT_EQ(Word(24), 0x14000002u);   // b .+8
+    EXPECT_EQ(Word(28), 0x14000000u);   // b other
+    EXPECT_EQ(Word(1040), 0xd65f03c0u); // ret
+  }
+  EXPECT_TRUE(Found);
+}
+
+TEST_P(MCPlusBuilderTester, DeferredReuseEndTrampolineAfterDistantBodyBranch) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const bool OldDeferred = opts::DoNotUseStubs;
+  scope_exit Restore([&] { opts::DoNotUseStubs = OldDeferred; });
+  opts::DoNotUseStubs = true;
+  BC->HasRelocations = true;
+  BC->AlignText = 4;
+  BinaryFunction *BF = BC->createInjectedBinaryFunction("reuse_end");
+  BF->markProfiled(0);
+  BinaryBasicBlock *Target = BF->addBasicBlock();
+  BinaryBasicBlock *BodyBranch = BF->addBasicBlock();
+  BinaryBasicBlock *Padding = BF->addBasicBlock();
+  BinaryBasicBlock *Cold = BF->addBasicBlock();
+  BinaryBasicBlock *Hot = BF->addBasicBlock();
+  const MCExpr *Destination =
+      MCSymbolRefExpr::create(Target->getLabel(), *BC->Ctx);
+  Target->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+  BodyBranch->addInstruction(MCInstBuilder(AArch64::B).addExpr(Destination));
+  for (unsigned I = 0; I != 256; ++I)
+    Padding->addInstruction(MCInstBuilder(AArch64::HINT).addImm(0));
+  Cold->setExecutionCount(10);
+  Cold->addSuccessor(Target, 0);
+  Cold->addInstruction(MCInstBuilder(AArch64::CBGTXri)
+                           .addReg(AArch64::X0)
+                           .addImm(0)
+                           .addExpr(Destination));
+  Hot->setExecutionCount(10);
+  Hot->addSuccessor(Target, 1);
+  Hot->addInstruction(MCInstBuilder(AArch64::CBGTXri)
+                          .addReg(AArch64::X1)
+                          .addImm(0)
+                          .addExpr(Destination));
+  Hot->addInstruction(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+  BC->updateOutputBinaryFunctions({BF});
+
+  SmallString<0> Buffer;
+  raw_svector_ostream OS(Buffer);
+  auto Streamer = BC->createStreamer(OS);
+  emitBinaryContext(*Streamer, *BC, "", /*RelaxBranches=*/true);
+  Streamer->finish();
+  ASSERT_FALSE(BC->Ctx->hadError());
+  auto Object = cantFail(ObjectFile::createObjectFile(
+      MemoryBufferRef(Buffer, "shared end trampoline")));
+  bool Found = false;
+  for (const SectionRef &Section : Object->sections()) {
+    if (cantFail(Section.getName()) != ".bolt.fragment.0")
+      continue;
+    Found = true;
+    const StringRef Code = cantFail(Section.getContents());
+    ASSERT_EQ(Code.size(), 1048u);
+    // The B at offset 4 is out of reach for both sources. The cold edge
+    // creates a tail B; the hot edge can reuse it without expanding inline.
+    EXPECT_EQ(support::endian::read32le(Code.data() + 1032), 0xf5000060u);
+    EXPECT_EQ(support::endian::read32le(Code.data() + 1036), 0xf5000041u);
+    EXPECT_EQ(support::endian::read32le(Code.data() + 1044), 0x17fffefbu);
+  }
+  EXPECT_TRUE(Found);
+}
+
 TEST_P(MCPlusBuilderTester, DeferredPatchCannotGrow) {
   if (GetParam() != Triple::aarch64)
     GTEST_SKIP();

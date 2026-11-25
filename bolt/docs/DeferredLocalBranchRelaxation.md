@@ -15,6 +15,15 @@ The late algorithm follows `LongJmpPass::relaxLocalBranches`:
 6. Repeat until the selected branches fit, recomputing the full layout only
    after inline growth; otherwise revisit the recorded branch references.
 
+Each instruction has one selected form: original, inline expansion, trampoline
+redirection, or branch-pair swap. Changing form replaces the old choice. End
+trampolines are tracked separately: a source may need inline expansion after
+code growth while other branches still use its tail trampoline.
+
+Reuse checks both body and end trampolines before attempting to create one.
+An unreachable body candidate does not hide a reachable end trampoline; hot
+edges can reuse a trampoline previously outlined for a cold edge.
+
 Source branches and CFI are collected once before the iteration loop. Inline
 growth recomputes only byte offsets; branch forms and trampoline reuse are
 rechecked on every iteration.

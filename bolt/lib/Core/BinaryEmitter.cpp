@@ -110,24 +110,18 @@ bool useFragmentSections(const BinaryContext &BC) {
   return opts::DoNotUseStubs && BC.isELF() && BC.isAArch64();
 }
 
-class LocalBranchRelaxation;
-
-/// Walk the final instruction stream, with optional output to MCStreamer.
-/// Callbacks observe block/instruction starts and may emit metadata, but never
-/// supply sizes or change placement. Offsets are section-relative and
-/// meaningful only with local relaxation; otherwise MC owns layout and
-/// alignment. Return the body end before any tail trampolines (which are
-/// emitted by the walk too).
-template <typename BlockCallback, typename InstructionCallback>
-uint64_t layoutFunctionFragment(const FunctionFragment &FF, BinaryContext &BC,
-                                const LocalBranchRelaxation *Relaxation,
-                                MCStreamer *Streamer, uint64_t Offset,
-                                bool EmitCodeOnly, BlockCallback &&BeginBlock,
-                                InstructionCallback &&BeginInstruction);
-
-/// Emit one selected instruction. In deferred mode the target descriptors give
-/// exact sizes: lowering has finished and MC cannot grow these instructions.
-uint64_t emitInstruction(BinaryContext &BC, const MCInst &Inst, MCStreamer *S) {
+/// Emit one selected instruction.
+uint64_t emitInstruction(BinaryContext &BC, const MCInst &Inst, MCStreamer *S,
+                         MCSymbol *Target = nullptr) {
+  // We either emit or compute layout
+  // (in this case we should know instruction size)
+  assert((S || BC.MII->get(Inst.getOpcode()).getSize()) &&
+         "local layout requires fixed-size instructions");
+  if (S && Target) {
+    MCInst Branch = Inst;
+    BC.MIB->replaceBranchTarget(Branch, Target, BC.Ctx.get());
+    return emitInstruction(BC, Branch, S);
+  }
   // Sized x86 NOPs must bypass the asm layer, which cannot encode them.
   if (BC.isX86() && BC.MIB->isNoop(Inst)) {
     if (std::optional<uint32_t> Size = BC.MIB->getSize(Inst)) {
@@ -146,8 +140,7 @@ uint64_t emitInstruction(BinaryContext &BC, const MCInst &Inst, MCStreamer *S) {
   return BC.MII->get(Inst.getOpcode()).getSize();
 }
 
-/// Emit and size the optional trap before the first block. Keep its size in the
-/// same place as its encoding, including when computing the body start.
+/// Emit and size the optional trap before the first block.
 uint64_t emitFunctionEntryTrap(const BinaryFunction &BF, MCStreamer *S) {
   for (const std::string &Name : opts::BreakFunctionNames) {
     if (BF.hasNameRegex(Name)) {
@@ -172,6 +165,50 @@ void emitBlockPadding(MCStreamer &Streamer, BinaryContext &BC,
   if (!BC.MAB->writeNopData(OS, Padding, BC.STI.get()))
     BC.Ctx->reportError(SMLoc(), "cannot emit basic block padding");
   Streamer.emitBytes(Nops);
+}
+
+/// Place blocks and selected instructions; callbacks only observe positions or
+/// emit metadata. A null streamer computes offsets without touching MCContext.
+/// Without local relaxation, MC owns sizing and alignment and offsets are
+/// unused. Return the body end, before tail trampolines.
+template <typename RelaxationT, typename BlockCallback,
+          typename InstructionCallback>
+uint64_t layoutFunctionFragment(const FunctionFragment &FF, BinaryContext &BC,
+                                const RelaxationT *Relaxation,
+                                MCStreamer *Streamer, bool EmitCodeOnly,
+                                BlockCallback &&BeginBlock,
+                                InstructionCallback &&BeginInstruction) {
+  assert((Streamer || Relaxation) && "layout requires local relaxation");
+  uint64_t Offset = Relaxation ? Relaxation->getBodyOffset() : 0;
+  for (BinaryBasicBlock *BB : FF) {
+    if ((BC.AlignBlocks || BC.PreserveBlocksAlignment) &&
+        BB->getAlignment() > 1) {
+      if (Relaxation) {
+        uint64_t Padding = offsetToAlignment(Offset, BB->getAlign());
+        if (BB->getAlignmentMaxBytes() && Padding > BB->getAlignmentMaxBytes())
+          Padding = 0;
+        Offset += Padding;
+        if (Streamer)
+          emitBlockPadding(*Streamer, BC, *BB, Padding);
+      } else {
+        Streamer->emitCodeAlignment(BB->getAlign(), *BC.STI,
+                                    BB->getAlignmentMaxBytes());
+      }
+    }
+    BeginBlock(*BB, Offset);
+    for (const MCInst &Inst : *BB) {
+      BeginInstruction(*BB, Inst, Offset);
+      if (BC.MIB->isCFI(Inst) || (EmitCodeOnly && BC.MIB->isPseudo(Inst)))
+        continue;
+      if (Relaxation)
+        Offset += Relaxation->emit(Inst, Streamer);
+      else
+        emitInstruction(BC, Inst, Streamer);
+    }
+  }
+  if (Relaxation && Streamer)
+    Relaxation->emitTrampolines(*Streamer);
+  return Offset;
 }
 
 bool fragmentMayFallThrough(const FunctionFragment &Fragment,
@@ -235,25 +272,26 @@ void splitSyntheticBranches(BinaryFunction &BF) {
 /// prepare() and emit*() write the selected forms without editing basic blocks.
 class LocalBranchRelaxation {
   BinaryContext &BC;
+  const BinaryFunction &BF;
+  const FunctionFragment &FF;
   const MCInst &Jump;
   using Target = std::pair<const MCSymbol *, int64_t>;
   // Same target and same preceding CFI directive: no CFI change between sites.
   using TrampolineKey = std::pair<Target, const MCInst *>;
 
-  // Conditional branches expanded at their original instruction positions.
-  DenseSet<const MCInst *> InlineBranches;
-  // Conditional branches whose B is emitted at the fragment end.
+  enum Form { Original, Inline, Redirect, Swap };
+  struct BranchForm {
+    Form Kind = Original;
+    // Redirect: source of the trampoline B. Swap: the other branch in the pair.
+    const MCInst *Other = nullptr;
+  };
+  DenseMap<const MCInst *, BranchForm> Forms;
+  // Tail Bs remain usable even if their sources later expand inline.
   DenseSet<const MCInst *> EndTrampolines;
   // Sources of labelled Bs in source order. Also orders end trampolines/CFI.
   SmallVector<const MCInst *, 0> LabelOrder;
 
-  // Conditional branch -> instruction identifying the B to use. The value is
-  // an existing B, or the source conditional of an inline/end trampoline B.
-  DenseMap<const MCInst *, const MCInst *> Redirects;
-  // B.cond far; B near pairs, stored in both directions.
-  DenseMap<const MCInst *, const MCInst *> SwappedPairs;
-
-  // B identity (as in Redirects) -> symbol marking that B in the output.
+  // Trampoline source -> symbol marking its B in the output.
   DenseMap<const MCInst *, MCSymbol *> Labels;
   // GNU_args_size at original branches; restore_state does not restore it.
   DenseMap<const MCInst *, uint64_t> ArgsSizes;
@@ -263,7 +301,7 @@ class LocalBranchRelaxation {
   // Whether this fragment emits an FDE, allowing CFI snapshots.
   bool HasCFI = false;
   // Body start within the private fragment section, including function prefix.
-  uint64_t BodyOffset = 0;
+  const uint64_t BodyOffset;
   // Whether end trampolines also need to restore GNU_args_size explicitly.
   bool HasArgs = false;
   // Whether body fall-through needs a B over the end-trampoline area.
@@ -306,18 +344,18 @@ class LocalBranchRelaxation {
 
   // A paired B emits the original conditional's target after a swap.
   Target actualTarget(const MCInst *Inst) const {
-    if (BC.MII->get(Inst->getOpcode()).isUnconditionalBranch())
-      if (const MCInst *Original = SwappedPairs.lookup(Inst))
-        Inst = Original;
+    const BranchForm F = Forms.lookup(Inst);
+    if (F.Kind == Swap &&
+        BC.MII->get(Inst->getOpcode()).isUnconditionalBranch())
+      Inst = F.Other;
     return target(*Inst);
   }
 
   /// Collect branch/CFI information once; subsequent walks only update offsets.
-  void updateLayout(const BinaryFunction &BF, const FunctionFragment &FF,
-                    uint64_t BodyOffset, FragmentInfo &Info, bool Initial) {
+  void updateLayout(FragmentInfo &Info, bool Initial) {
     uint64_t ArgsSize = 0;
     Info.CodeSize = layoutFunctionFragment(
-        FF, BC, this, /*Streamer=*/nullptr, BodyOffset, /*EmitCodeOnly=*/false,
+        FF, BC, this, /*Streamer=*/nullptr, /*EmitCodeOnly=*/false,
         [&](const BinaryBasicBlock &BB, uint64_t Offset) {
           Info.BlockOffsets[&BB] = Offset;
         },
@@ -358,7 +396,7 @@ class LocalBranchRelaxation {
 
   void redirect(const MCInst &Inst, const MCInst *Via,
                 const FragmentInfo &Info) {
-    Redirects[&Inst] = Via;
+    Forms[&Inst] = {Redirect, Via};
     if (Labels.try_emplace(Via, nullptr).second) {
       auto Position = llvm::lower_bound(
           LabelOrder, Via, [&](const MCInst *A, const MCInst *B) {
@@ -368,7 +406,7 @@ class LocalBranchRelaxation {
     }
   }
 
-  void rebuildBodyTrampolines(const FunctionFragment &FF, FragmentInfo &Info) {
+  void rebuildBodyTrampolines(FragmentInfo &Info) {
     // A pair swap can change a B's destination even when no instruction grows.
     Info.BodyTrampolines.clear();
     auto Register = [&](const MCInst *Inst) {
@@ -383,7 +421,7 @@ class LocalBranchRelaxation {
         Register(B);
     }
     for (const auto &[BB, Inst] : Info.Branches)
-      if (InlineBranches.contains(Inst) && !EndTrampolines.contains(Inst))
+      if (Forms.lookup(Inst).Kind == Inline && !EndTrampolines.contains(Inst))
         Register(Inst);
   }
 
@@ -406,7 +444,7 @@ class LocalBranchRelaxation {
     if (EndTrampolines.contains(Source))
       return endTrampolineOffset(Source, Info);
     uint64_t Offset = 0;
-    if (InlineBranches.contains(Source))
+    if (Forms.lookup(Source).Kind == Inline)
       emit(*Source, nullptr, &Offset);
     return Info.BranchOffsets.lookup(Source) + Offset;
   }
@@ -418,28 +456,35 @@ class LocalBranchRelaxation {
     return !(Delta & 3) && isIntN(BC.MIB->getPCRelEncodingSize(Inst), Delta);
   }
 
+  bool isInRange(const MCInst &Inst, const FragmentInfo &Info,
+                 Target Destination) const {
+    const auto *BB = BF.getBasicBlockForLabel(Destination.first);
+    return BB && Info.BlockOffsets.count(BB) &&
+           isInRange(Inst, Info, Info.BlockOffsets.lookup(BB),
+                     Destination.second);
+  }
+
   bool tryReuseTrampoline(const MCInst &Inst, const Target &Destination,
                           const FragmentInfo &Info) {
     const TrampolineKey K{Destination, Info.CFIBefore.lookup(&Inst)};
-    const MCInst *B = Info.BodyTrampolines.lookup(K);
-    if (!B)
-      B = Info.SharedEndTrampolines.lookup(K);
-    if (!B || actualTarget(B) != Destination ||
-        !isInRange(Inst, Info, trampolineOffset(B, Info)))
-      return false;
-    redirect(Inst, B, Info);
-    return true;
+    for (const MCInst *B : {Info.BodyTrampolines.lookup(K),
+                            Info.SharedEndTrampolines.lookup(K)}) {
+      if (B && actualTarget(B) == Destination &&
+          isInRange(Inst, Info, trampolineOffset(B, Info))) {
+        redirect(Inst, B, Info);
+        return true;
+      }
+    }
+    return false;
   }
 
-  bool tryOutlineBranch(const BinaryFunction &BF, const BinaryBasicBlock &BB,
-                        const MCInst &Inst, const Target &Destination,
-                        FragmentInfo &Info) {
+  bool tryOutlineBranch(const BinaryBasicBlock &BB, const MCInst &Inst,
+                        const Target &Destination, FragmentInfo &Info) {
     // Lowering preserves saved edges/counts. Read a count only for a matching
     // zero-addend local target and a valid profile.
     BinaryBasicBlock::BinaryBranchInfo Edge;
     const bool Cold =
         BF.hasValidProfile() && BB.hasProfile() && !Destination.second &&
-        BF.getBasicBlockForLabel(Destination.first) &&
         BB.getSuccessor(Destination.first, Edge) && Edge.Count == 0;
     // A later fall-through must retain its original end CFI state.
     if (BF.isPatch() || (!Cold && !Info.PreserveLayout) || Info.HasOpaqueCFI ||
@@ -448,24 +493,19 @@ class LocalBranchRelaxation {
       return false;
 
     const TrampolineKey K{Destination, Info.CFIBefore.lookup(&Inst)};
-    const MCInst *B =
-        Destination.first ? Info.SharedEndTrampolines.lookup(K) : nullptr;
-    const uint64_t Offset =
-        B ? trampolineOffset(B, Info) : endTrampolineOffset(&Inst, Info);
-    if (!isInRange(Inst, Info, Offset))
+    // Reuse was already tried. Do not duplicate an unreachable end trampoline.
+    if (Info.SharedEndTrampolines.count(K) ||
+        !isInRange(Inst, Info, endTrampolineOffset(&Inst, Info)))
       return false;
-    if (!B) {
-      B = &Inst;
-      EndTrampolines.insert(B);
-      if (Destination.first)
-        Info.SharedEndTrampolines[K] = B;
-    }
-    redirect(Inst, B, Info);
+    EndTrampolines.insert(&Inst);
+    if (Destination.first)
+      Info.SharedEndTrampolines[K] = &Inst;
+    redirect(Inst, &Inst, Info);
     return true;
   }
 
-  bool trySwapBranchPair(const BinaryFunction &BF, const BinaryBasicBlock &BB,
-                         const MCInst &Inst, const FragmentInfo &Info) {
+  bool trySwapBranchPair(const BinaryBasicBlock &BB, const MCInst &Inst,
+                         const FragmentInfo &Info) {
     if (Info.PreserveLayout || !BC.MIB->isReversibleBranch(Inst))
       return false;
 
@@ -488,50 +528,39 @@ class LocalBranchRelaxation {
     if (!Next || Info.CFIBefore.lookup(Next) != Info.CFIBefore.lookup(&Inst) ||
         !BC.MII->get(Next->getOpcode()).isUnconditionalBranch())
       return false;
-    const Target NearTarget = target(*Next);
-    const auto *NearBB = BF.getBasicBlockForLabel(NearTarget.first);
-    if (!NearBB || !Info.BlockOffsets.count(NearBB) ||
-        !isInRange(Inst, Info, Info.BlockOffsets.lookup(NearBB),
-                   NearTarget.second))
+    if (!isInRange(Inst, Info, target(*Next)))
       return false;
-    SwappedPairs[&Inst] = Next;
-    SwappedPairs[Next] = &Inst;
+    Forms[&Inst] = {Swap, Next};
+    Forms[Next] = {Swap, &Inst};
     return true;
   }
 
-  bool relaxBranches(const BinaryFunction &BF, const FunctionFragment &FF,
-                     FragmentInfo &Info) {
+  bool relaxBranches(FragmentInfo &Info, bool &LayoutChanged) {
     // Growth changes reachability; swaps can invalidate users of an existing B.
     bool PlanChanged = false;
     for (const auto &[BB, InstPtr] : Info.Branches) {
       const MCInst &Inst = *InstPtr;
-      if (InlineBranches.contains(&Inst))
+      const BranchForm F = Forms.lookup(&Inst);
+      if (F.Kind == Inline)
         continue;
       const Target Destination = target(Inst);
       const BinaryBasicBlock *TargetBB =
           BF.getBasicBlockForLabel(Destination.first);
       if (TargetBB && Info.PreserveLayout && !Destination.second)
         continue;
-      if (!Redirects.count(&Inst) && !SwappedPairs.count(&Inst) && TargetBB &&
-          TargetBB->getFragmentNum() == FF.getFragmentNum() &&
-          isInRange(Inst, Info, Info.BlockOffsets.lookup(TargetBB),
-                    Destination.second))
+      if (F.Kind == Original && isInRange(Inst, Info, Destination))
         continue;
 
-      if (const MCInst *Via = Redirects.lookup(&Inst)) {
-        if (actualTarget(Via) == Destination &&
-            isInRange(Inst, Info, trampolineOffset(Via, Info)))
+      if (F.Kind == Redirect) {
+        if (actualTarget(F.Other) == Destination &&
+            isInRange(Inst, Info, trampolineOffset(F.Other, Info)))
           continue;
-      } else if (const MCInst *Near = SwappedPairs.lookup(&Inst)) {
-        const Target NearTarget = target(*Near);
-        const auto *NearBB = BF.getBasicBlockForLabel(NearTarget.first);
-        if (NearBB && Info.BlockOffsets.count(NearBB) &&
-            isInRange(Inst, Info, Info.BlockOffsets.lookup(NearBB),
-                      NearTarget.second))
+      } else if (F.Kind == Swap) {
+        if (isInRange(Inst, Info, target(*F.Other)))
           continue;
       } else if (tryReuseTrampoline(Inst, Destination, Info) ||
-                 tryOutlineBranch(BF, *BB, Inst, Destination, Info) ||
-                 trySwapBranchPair(BF, *BB, Inst, Info)) {
+                 tryOutlineBranch(*BB, Inst, Destination, Info) ||
+                 trySwapBranchPair(*BB, Inst, Info)) {
         PlanChanged = true;
         continue;
       }
@@ -542,11 +571,10 @@ class LocalBranchRelaxation {
         Error = &Inst;
         return false;
       }
-      Redirects.erase(&Inst);
-      if (const MCInst *B = SwappedPairs.lookup(&Inst))
-        SwappedPairs.erase(B);
-      SwappedPairs.erase(&Inst);
-      InlineBranches.insert(&Inst);
+      if (F.Kind == Swap)
+        Forms.erase(F.Other);
+      Forms[&Inst] = {Inline};
+      LayoutChanged = true;
       if (Destination.first && !EndTrampolines.contains(&Inst))
         Info.BodyTrampolines.try_emplace(
             TrampolineKey{Destination, Info.CFIBefore.lookup(&Inst)}, &Inst);
@@ -556,20 +584,20 @@ class LocalBranchRelaxation {
   }
 
 public:
-  LocalBranchRelaxation(BinaryContext &BC, const MCInst &Jump)
-      : BC(BC), Jump(Jump) {}
+  LocalBranchRelaxation(BinaryFunction &BF, const FunctionFragment &FF,
+                        const MCInst &Jump, uint64_t BodyOffset)
+      : BC(BF.getBinaryContext()), BF(BF), FF(FF), Jump(Jump),
+        BodyOffset(BodyOffset) {}
 
   uint64_t getBodyOffset() const { return BodyOffset; }
 
-  void run(const BinaryFunction &BF, const FunctionFragment &FF,
-           uint64_t BodyOffset) {
-    this->BodyOffset = BodyOffset;
+  void run() {
     HasCFI = BF.hasCFI() && !(BF.isPatch() && BF.isAnonymous());
     HasArgs = HasCFI && BF.usesGnuArgsSize();
     FragmentInfo Info;
     Info.PreserveLayout = !BF.isSimple() || BF.isPatch();
     Info.FallThrough = fragmentMayFallThrough(FF, BC);
-    updateLayout(BF, FF, BodyOffset, Info, /*Initial=*/true);
+    updateLayout(Info, /*Initial=*/true);
 
     // If the shortest encoding spans the whole body, no local branch can
     // initiate growth. Addends disable this shortcut.
@@ -578,17 +606,17 @@ public:
       return;
 
     for (;;) {
-      rebuildBodyTrampolines(FF, Info);
-      const size_t OldInlineCount = InlineBranches.size();
-      if (!relaxBranches(BF, FF, Info) || Error)
+      rebuildBodyTrampolines(Info);
+      bool LayoutChanged = false;
+      if (!relaxBranches(Info, LayoutChanged))
         break;
-      if (OldInlineCount != InlineBranches.size())
-        updateLayout(BF, FF, BodyOffset, Info, /*Initial=*/false);
+      if (LayoutChanged)
+        updateLayout(Info, /*Initial=*/false);
     }
     Guard = !EndTrampolines.empty() && Info.FallThrough;
   }
 
-  bool prepare(const BinaryFunction &BF) {
+  bool prepare() {
     if (Error) {
       BC.Ctx->reportError(
           Error->getLoc(),
@@ -606,49 +634,50 @@ public:
     return true;
   }
 
-  void emitBefore(const MCInst &Inst, MCStreamer &S) const {
-    if (!InlineBranches.contains(&Inst) && !EndTrampolines.contains(&Inst))
-      if (MCSymbol *Label = Labels.lookup(&Inst))
-        S.emitLabel(Label);
-    if (HasCFI && EndTrampolines.contains(&Inst))
-      S.emitCFIRememberState(Inst.getLoc());
-  }
-
   /// A null streamer selects and sizes exactly the same MCInsts as emission.
   uint64_t emit(const MCInst &Inst, MCStreamer *S = nullptr,
                 uint64_t *TrampolineOffset = nullptr) const {
     if (BC.MIB->isPseudo(Inst))
       return 0;
     if (!BC.MII->get(Inst.getOpcode()).isBranch())
-      return emitInstruction(Inst, S);
+      return emitInstruction(BC, Inst, S);
+    const BranchForm F = Forms.lookup(&Inst);
+    if (S) {
+      if (F.Kind != Inline && !EndTrampolines.contains(&Inst))
+        if (MCSymbol *Label = Labels.lookup(&Inst))
+          S->emitLabel(Label);
+      if (HasCFI && EndTrampolines.contains(&Inst))
+        S->emitCFIRememberState(Inst.getLoc());
+    }
     uint64_t Size = 0;
-    if (const MCInst *Other = SwappedPairs.lookup(&Inst)) {
+    if (F.Kind == Swap) {
       if (BC.MIB->isConditionalBranch(Inst)) {
         MCInst B =
             BC.MIB->reverseBranchCondition(Inst, nullptr, nullptr).front();
-        B.getOperand(MCPlus::getNumPrimeOperands(B) - 1) = Other->getOperand(0);
-        return emitInstruction(B, S);
+        B.getOperand(MCPlus::getNumPrimeOperands(B) - 1) =
+            F.Other->getOperand(0);
+        return emitInstruction(BC, B, S);
       }
-      return emitInstruction(jump(*Other), S);
+      return emitInstruction(BC, jump(*F.Other), S);
     }
-    if (const MCInst *Via = Redirects.lookup(&Inst))
-      return emitTo(Inst, Labels.lookup(Via), S);
-    if (!InlineBranches.contains(&Inst))
-      return emitInstruction(Inst, S);
+    if (F.Kind == Redirect)
+      return emitInstruction(BC, Inst, S, Labels.lookup(F.Other));
+    if (F.Kind != Inline)
+      return emitInstruction(BC, Inst, S);
 
     MCSymbol *Next = S ? BC.Ctx->createTempSymbol("local_branch_end") : nullptr;
     if (BC.MIB->isReversibleBranch(Inst)) {
       for (const MCInst &B :
            BC.MIB->reverseBranchCondition(Inst, nullptr, nullptr))
-        Size += BC.MII->get(B.getOpcode()).isBranch() ? emitTo(B, Next, S)
-                                                      : emitInstruction(B, S);
+        Size += emitInstruction(
+            BC, B, S, BC.MII->get(B.getOpcode()).isBranch() ? Next : nullptr);
     } else {
       MCSymbol *Taken =
           S ? BC.Ctx->createTempSymbol("local_branch_taken") : nullptr;
-      Size += emitTo(Inst, Taken, S);
+      Size += emitInstruction(BC, Inst, S, Taken);
       MCInst Skip = jump(Inst);
       Skip.setLoc(Inst.getLoc());
-      Size += emitTo(Skip, Next, S);
+      Size += emitInstruction(BC, Skip, S, Next);
       if (S)
         S->emitLabel(Taken);
     }
@@ -657,7 +686,7 @@ public:
     if (S && !EndTrampolines.contains(&Inst))
       if (MCSymbol *Label = Labels.lookup(&Inst))
         S->emitLabel(Label);
-    Size += emitInstruction(jump(Inst), S);
+    Size += emitInstruction(BC, jump(Inst), S);
     if (S)
       S->emitLabel(Next);
     return Size;
@@ -668,22 +697,9 @@ public:
   }
 
 private:
-  uint64_t emitInstruction(const MCInst &Inst, MCStreamer *S) const {
-    assert(
-        (BC.MIB->isPseudo(Inst) || BC.MII->get(Inst.getOpcode()).getSize()) &&
-        "local layout requires fixed-size instructions");
-    return ::emitInstruction(BC, Inst, S);
-  }
-
-  uint64_t emitTo(MCInst Inst, MCSymbol *Target, MCStreamer *S) const {
-    if (S)
-      BC.MIB->replaceBranchTarget(Inst, Target, BC.Ctx.get());
-    return emitInstruction(Inst, S);
-  }
-
   uint64_t emitTrampolines(MCStreamer *S, ArrayRef<const MCInst *> Order,
                            bool NeedsGuard) const {
-    uint64_t Size = NeedsGuard ? emitTo(Jump, End, S) : 0;
+    uint64_t Size = NeedsGuard ? emitInstruction(BC, Jump, S, End) : 0;
     for (const MCInst *Source : llvm::reverse(Order)) {
       if (!EndTrampolines.contains(Source))
         continue;
@@ -695,7 +711,7 @@ private:
         }
         S->emitLabel(Labels.lookup(Source));
       }
-      Size += emitInstruction(jump(*Source), S);
+      Size += emitInstruction(BC, jump(*Source), S);
     }
     if (S && End)
       S->emitLabel(End);
@@ -703,46 +719,6 @@ private:
   }
 };
 
-template <typename BlockCallback, typename InstructionCallback>
-uint64_t layoutFunctionFragment(const FunctionFragment &FF, BinaryContext &BC,
-                                const LocalBranchRelaxation *Relaxation,
-                                MCStreamer *Streamer, uint64_t Offset,
-                                bool EmitCodeOnly, BlockCallback &&BeginBlock,
-                                InstructionCallback &&BeginInstruction) {
-  assert((Streamer || Relaxation) && "layout requires local relaxation");
-  for (BinaryBasicBlock *BB : FF) {
-    if ((BC.AlignBlocks || BC.PreserveBlocksAlignment) &&
-        BB->getAlignment() > 1) {
-      if (Relaxation) {
-        uint64_t Padding = offsetToAlignment(Offset, BB->getAlign());
-        if (BB->getAlignmentMaxBytes() && Padding > BB->getAlignmentMaxBytes())
-          Padding = 0;
-        Offset += Padding;
-        if (Streamer)
-          emitBlockPadding(*Streamer, BC, *BB, Padding);
-      } else {
-        Streamer->emitCodeAlignment(BB->getAlign(), *BC.STI,
-                                    BB->getAlignmentMaxBytes());
-      }
-    }
-    BeginBlock(*BB, Offset);
-    for (const MCInst &Inst : *BB) {
-      BeginInstruction(*BB, Inst, Offset);
-      if (BC.MIB->isCFI(Inst) || (EmitCodeOnly && BC.MIB->isPseudo(Inst)))
-        continue;
-      if (Relaxation) {
-        if (Streamer && BC.MII->get(Inst.getOpcode()).isBranch())
-          Relaxation->emitBefore(Inst, *Streamer);
-        Offset += Relaxation->emit(Inst, Streamer);
-      } else {
-        emitInstruction(BC, Inst, Streamer);
-      }
-    }
-  }
-  if (Relaxation && Streamer)
-    Relaxation->emitTrampolines(*Streamer);
-  return Offset;
-}
 
 class BinaryEmitter {
 private:
@@ -889,37 +865,36 @@ void BinaryEmitter::emitAll(StringRef OrgSecPrefix) {
 void BinaryEmitter::relaxLocalBranches() {
   BC.MIB->createUncondBranch(LocalBranchJump, BC.Ctx->createTempSymbol(),
                              BC.Ctx.get());
-  DenseMap<const BinaryFunction *, uint64_t> BodyOffsets;
   for (BinaryFunction *BF : BC.getOutputBinaryFunctions()) {
     if (!BC.shouldEmit(*BF) || (BF->empty() && !BF->hasIslandsInfo()) ||
         BF->getState() == BinaryFunction::State::Empty)
       continue;
-    BodyOffsets[BF] = opts::padFunctionBefore(*BF) +
-                      emitFunctionEntryTrap(*BF, /*S=*/nullptr);
+    const uint64_t BodyOffset = opts::padFunctionBefore(*BF) +
+                                emitFunctionEntryTrap(*BF, /*S=*/nullptr);
     if (BF->isSplit() && BF->hasConstantIsland())
       BF->duplicateConstantIslands();
     splitSyntheticBranches(*BF);
     for (FunctionFragment &FF : BF->getLayout().fragments())
       // Skip only empty fragments without constant islands
       if (!FF.isSplitFragment() || !FF.empty() || BF->hasConstantIsland())
-        Relaxations[&FF] =
-            std::make_unique<LocalBranchRelaxation>(BC, LocalBranchJump);
+        Relaxations[&FF] = std::make_unique<LocalBranchRelaxation>(
+            *BF, FF, LocalBranchJump, BodyOffset);
   }
   const auto &Plans = Relaxations;
-  const auto &Offsets = BodyOffsets;
   auto Relax = [&](BinaryFunction &BF) {
     for (FunctionFragment &FF : BF.getLayout().fragments())
       if (auto I = Plans.find(&FF); I != Plans.end())
-        I->second->run(BF, FF, Offsets.lookup(&BF));
+        I->second->run();
   };
   ParallelUtilities::runOnEachFunction(
       BC, ParallelUtilities::SP_INST_LINEAR, Relax,
-      [&](const BinaryFunction &BF) { return !Offsets.count(&BF); },
+      [&](const BinaryFunction &BF) {
+        return !Plans.count(&BF.getLayout().getMainFragment());
+      },
       "RelaxLocalBranches");
   // runOnEachFunction only visits input functions.
   for (BinaryFunction *BF : BC.getInjectedBinaryFunctions())
-    if (Offsets.count(BF))
-      Relax(*BF);
+    Relax(*BF);
 }
 
 void BinaryEmitter::emitFunctions() {
@@ -1011,7 +986,7 @@ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
   LocalBranchRelaxation *Relaxation = nullptr;
   if (auto I = Relaxations.find(&FF); I != Relaxations.end()) {
     Relaxation = I->second.get();
-    if (!Relaxation->prepare(Function))
+    if (!Relaxation->prepare())
       return false;
   }
 
@@ -1193,8 +1168,7 @@ void BinaryEmitter::emitFunctionBody(BinaryFunction &BF, FunctionFragment &FF,
   bool FirstInstr = true;
   SMLoc LastLocSeen;
   layoutFunctionFragment(
-      FF, BC, Relaxation, &Streamer,
-      Relaxation ? Relaxation->getBodyOffset() : 0, EmitCodeOnly,
+      FF, BC, Relaxation, &Streamer, EmitCodeOnly,
       [&](BinaryBasicBlock &BB, uint64_t) {
         LastLocSeen = SMLoc();
         Streamer.emitLabel(BB.getLabel());
