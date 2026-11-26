@@ -38,9 +38,10 @@ the same walk and writes fixed NOP padding, preserving section alignment even
 when the budget skips padding. Other emission modes retain MC alignment and
 relaxation.
 
-Inline and end-trampoline offsets use the same instruction-selection routines
-as emission, including the flags-preserving irreversible CMPBR sequence and
-the fall-through guard. Context-free branch inversion preserves the target
+Inline expansions end with an unconditional B. End trampolines are kept in
+reverse source order so each B restores the matching CFI state. Its offset is
+the body end plus one B for each preceding trampoline and the optional guard.
+Context-free branch inversion preserves the target
 operand, and workers copy a prebuilt unconditional branch, so neither operation
 allocates expressions or symbols in the shared MCContext.
 
@@ -49,18 +50,14 @@ when near fits the short encoding. A failed reuse or pair choice is rechecked
 and falls back to inline expansion. Targets use the existing MCPlusBuilder
 symbol/addend helpers; expansion preserves the original target operand.
 
-When updating debug info, synthetic terminal Bs with local successors are split
-into separate BBs before planning. Instructions and trailing CFIs keep their
-emission order; alignment stays on the original BB. Lowered tail calls,
-non-simple functions and patches are left alone. Reuse requires no CFI change
-between source and trampoline. End trampolines save source rows and restore them in reverse source
-order; GNU_args_size is emitted explicitly.
-Opaque CFI and differing unwind rows at a fall-through continuation disable
-outlining. Fixed-footprint patches cannot acquire extra instructions.
+With debug updates enabled, the final instruction walk records block-relative
+ends for DWARF ranges. A B added for a displaced fall-through is excluded.
+A replacement for an input branch retains its input offset.
 
-Synthetic branch BBs have no input range. Existing debug-range translation can
-therefore stop at the original BB's end, excluding the added B without a
-separate instruction-end address map.
+Trampoline reuse requires the same preceding CFI directive at both sites.
+End trampolines explicitly restore GNU_args_size. Opaque CFI and differing
+unwind rows at a fall-through continuation disable outlining. Fixed-footprint
+patches cannot acquire extra instructions.
 
 InstructionLowering preserves successor vectors and counts but removes tail-call
 annotations. Cold-edge decisions therefore require a valid function profile,

@@ -43,14 +43,12 @@ private:
   StringMap<SymbolInfo> Symtab;
 
 public:
-  /// Metadata must outlive fragment placement.
   using FragmentMap =
       DenseMap<const jitlink::Block *, const EmittedFragmentSection *>;
 
   struct AArch64Branch {
     jitlink::Block *SourceBlock;
-    // Source edges are not reordered after reservation. Materialization only
-    // appends edges to separate stub island blocks.
+    // Source edges are not reordered after reservation.
     size_t EdgeIndex;
 
     jitlink::Edge &getEdge() const {
@@ -87,7 +85,6 @@ public:
   /// Reserve shared AArch64 stub islands ahead of batches of whole fragments.
   /// Store the final section-relative placements in the blocks themselves.
   /// Each input code block is one indivisible emitted fragment section.
-  /// Preserve its mandatory alignment and apply bounded entry preferences.
   /// Optionally report aggregate batch and layout statistics per section to Log.
   static Expected<std::vector<AArch64Stub>>
   reserveAArch64Stubs(jitlink::LinkGraph &G,

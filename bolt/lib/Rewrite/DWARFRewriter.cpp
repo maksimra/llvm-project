@@ -1323,12 +1323,21 @@ void DWARFRewriter::updateUnitDebugInfo(
     case dwarf::DW_TAG_call_site: {
       auto patchPC = [&](DIE *Die, DIEValue &AttrVal, StringRef Entry) -> void {
         std::optional<uint64_t> Address = getAsAddress(Unit, AttrVal);
-        const BinaryFunction *Function =
-            BC.getBinaryFunctionContainingAddress(*Address);
+        if (!Address)
+          return;
         uint64_t UpdatedAddress = *Address;
-        if (Function)
-          UpdatedAddress =
-              Function->translateInputToOutputAddress(UpdatedAddress);
+        std::optional<uint64_t> Call;
+        constexpr uint64_t AArch64CallSize = 4;
+        // The input successor can move away from the call during layout.
+        if (AttrVal.getAttribute() == dwarf::DW_AT_call_return_pc &&
+            !BC.EmittedFragmentSections.empty() && BC.hasIOAddressMap() &&
+            *Address >= AArch64CallSize)
+          Call = BC.getIOAddressMap().lookup(*Address - AArch64CallSize);
+        if (Call)
+          UpdatedAddress = *Call + AArch64CallSize;
+        else if (const BinaryFunction *Function =
+                     BC.getBinaryFunctionContainingAddress(*Address))
+          UpdatedAddress = Function->translateInputToOutputAddress(*Address);
 
         if (AttrVal.getForm() == dwarf::DW_FORM_addrx) {
           const uint32_t Index =

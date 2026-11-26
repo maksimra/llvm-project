@@ -85,7 +85,7 @@ struct EmittedFragmentSection {
   /// Zero MaxAlignmentBytes disables it, as in BinaryEmitter::emitFunction.
   uint64_t PreferredAlignment{1};
   uint16_t MaxAlignmentBytes{0};
-  /// Skip any unexecuted --pad-funcs-before bytes when entering this fragment.
+  /// --pad-funcs-before bytes
   uint64_t EntryOffset{0};
 };
 

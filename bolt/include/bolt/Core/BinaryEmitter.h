@@ -32,7 +32,7 @@ class FunctionFragment;
 void emitBinaryContext(MCStreamer &Streamer, BinaryContext &BC,
                        StringRef OrgSecPrefix = "");
 
-/// Emit finalized code with local relaxation, called only by emitAndLink.
+/// Emit finalized code with local relaxation.
 void emitBinaryContext(MCStreamer &Streamer, BinaryContext &BC,
                        StringRef OrgSecPrefix, bool RelaxBranches);
 

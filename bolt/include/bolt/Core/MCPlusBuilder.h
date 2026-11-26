@@ -2164,7 +2164,7 @@ public:
   /// \p Inst and update its taken target to \p TBB. Assumes that the branch is
   /// reversible. It may replace Inst with a longer instruction sequence on some
   /// targets. If TBB is null, preserve the original target operand; Ctx is then
-  /// unused. This permits instruction selection without allocating expressions.
+  /// unused.
   virtual InstructionListType
   reverseBranchCondition(MCInst Inst, const MCSymbol *TBB, MCContext *Ctx,
                          bool MustPreserveFlags = true) const {

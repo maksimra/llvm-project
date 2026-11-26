@@ -21,8 +21,7 @@
 # RUN:   --reorder-blocks=reverse
 # RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=swap %t.swap.bolt \
 # RUN:   | FileCheck %s --check-prefix=SWAP
-## Debug-range preparation splits the synthetic B into the next BB; the pair
-## must still use the same short inversion without adding instructions.
+## Updating DWARF must preserve the same short inversion.
 # RUN: llvm-bolt %t.swap -o %t.swap.debug.bolt --turn-off-stubs --lite=0 \
 # RUN:   --keep-nops --reorder-blocks=reverse --update-debug-sections
 # RUN: llvm-objdump -d --no-show-raw-insn --disassemble-symbols=swap %t.swap.debug.bolt \

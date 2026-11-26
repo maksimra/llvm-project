@@ -11,7 +11,7 @@
 # RUN: llvm-objdump -d --no-show-raw-insn --mattr=+pauth \
 # RUN:   --disassemble-symbols=metadata %t.bolt > %t.dump
 # RUN: llvm-dwarfdump --debug-info --eh-frame --debug-line %t.bolt >> %t.dump
-# RUN: FileCheck %s --input-file=%t.dump
+# RUN: FileCheck %s --input-file=%t.dump -D#PAD=0
 # RUN: llvm-dwarfdump --verify %t.bolt | FileCheck %s --check-prefix=VERIFY
 # RUN: %python %p/Inputs/check-local-branches-lsda.py %t.bolt %t.dump
 
@@ -19,11 +19,12 @@
 # RUN:   -dwarf-version=5 --defsym=DWARF5=1 %s -o %t.5.o
 # RUN: ld.lld --emit-relocs -e metadata %t.5.o -o %t.5.exe
 # RUN: llvm-bolt %t.5.exe -o %t.5.bolt --turn-off-stubs --lite=0 --keep-nops \
-# RUN:   --reorder-blocks=reverse --update-debug-sections --verify-branch26-range
+# RUN:   --reorder-blocks=reverse --update-debug-sections --verify-branch26-range \
+# RUN:   --pad-funcs-before=metadata:4 --pad-funcs=metadata:16
 # RUN: llvm-objdump -d --no-show-raw-insn --mattr=+pauth \
 # RUN:   --disassemble-symbols=metadata %t.5.bolt > %t.5.dump
 # RUN: llvm-dwarfdump --debug-info --eh-frame --debug-line %t.5.bolt >> %t.5.dump
-# RUN: FileCheck %s --input-file=%t.5.dump
+# RUN: FileCheck %s --input-file=%t.5.dump -D#PAD=16
 # RUN: llvm-dwarfdump --verify %t.5.bolt | FileCheck %s --check-prefix=VERIFY
 # RUN: %python %p/Inputs/check-local-branches-lsda.py %t.5.bolt %t.5.dump
 
@@ -37,7 +38,7 @@
 # CHECK-NEXT: {{0*}}[[#FALL]]: b 0x[[#%x,CALL:]]
 # CHECK-NEXT: [[#%x,RETURN:]]: ldp x29, x30, [sp], #0x10
 # CHECK-NEXT: autiasp
-# CHECK-NEXT: ret
+# CHECK-NEXT: [[#%x,TAIL:]]: b {{.*}} <personality>
 # CHECK-NEXT: [[#%x,LP:]]: mov w0, #0x2a
 # CHECK: {{0*}}[[#CALL]]: bl
 # CHECK-NEXT: b
@@ -46,17 +47,19 @@
 
 # CHECK: DW_TAG_subprogram
 # CHECK: DW_AT_low_pc (0x{{0*}}[[#START]])
-# CHECK: DW_AT_high_pc (0x{{0*}}[[#TAKEN + 8]])
-## Splitting the synthetic fall-through B into its own BB keeps the call's
-## input range from including that branch, without an instruction-end map.
+# CHECK: DW_AT_high_pc (0x{{0*}}[[#%x,TAKEN + 8 + PAD]])
+## The input range includes the original B at TAKEN and ends after the BL at CALL.
 # CHECK: DW_TAG_variable
-# CHECK: [0x{{0*}}[[#START]], 0x{{0*}}[[#FALL]]): DW_OP_reg8 W8
+# CHECK: [0x{{0*}}[[#START]], 0x{{0*}}[[#FALL + 4]]): DW_OP_reg8 W8
+# CHECK-NEXT: [0x{{0*}}[[#TAIL]], 0x{{0*}}[[#TAIL + 4]]): DW_OP_reg8 W8
 # CHECK: [0x{{0*}}[[#CALL]], 0x{{0*}}[[#CALL + 4]]): DW_OP_reg8 W8
-# CHECK-NEXT: [0x{{0*}}[[#TAKEN]], 0x{{0*}}[[#TAKEN + 4]]): DW_OP_reg8 W8
+# CHECK-NEXT: [0x{{0*}}[[#TAKEN]], 0x{{0*}}[[#TAKEN + 8]]): DW_OP_reg8 W8
+# CHECK: DW_TAG_call_site
+# CHECK: DW_AT_call_return_pc (0x{{0*}}[[#CALL + 4]])
 
 ## Both added branches inherit the CFA and signed-RA state of the TBZ. The
 ## epilogue and landing pad retain their own rules at their shifted addresses.
-# CHECK: FDE cie={{.*}} pc={{0*}}[[#START]]...{{0*}}[[#TAKEN + 8]]
+# CHECK: FDE cie={{.*}} pc={{0*}}[[#START]]...{{0*}}[[#%x,TAKEN + 8 + PAD]]
 # CHECK: LSDA Address:
 # CHECK: 0x[[#START]]: CFA=WSP
 # CHECK-NEXT: 0x[[#START + 4]]: CFA=WSP: reg34=1
@@ -74,7 +77,7 @@
 # CHECK-NEXT: 0x{{0*}}[[#LP]] 6 0
 # CHECK: 0x{{0*}}[[#CALL]] 3 0
 # CHECK-NEXT: 0x{{0*}}[[#TAKEN]] 4 0
-# CHECK-NEXT: 0x{{0*}}[[#TAKEN + 8]] 4 0 {{.*}} end_sequence
+# CHECK-NEXT: 0x{{0*}}[[#%x,TAKEN + 8 + PAD]] 4 0 {{.*}} end_sequence
 
 .text
 .ifdef DWARF5
@@ -133,7 +136,8 @@ metadata:
   .cfi_restore w30
   autiasp
   .cfi_negate_ra_state
-  ret
+.Ltail:
+  b personality
   .cfi_endproc
 .Lend:
 .size metadata, .-metadata
@@ -175,6 +179,9 @@ personality:
   .byte 3, 8
   .byte 2, 23
   .byte 0, 0
+  .byte 4, 72, 0
+  .byte 125, 1
+  .byte 0, 0
   .byte 0
 
 .section .debug_info,"",@progbits
@@ -203,6 +210,8 @@ personality:
   .byte 3
   .asciz "x"
   .long .Lloc
+  .byte 4
+  .quad .Lcallend
   .byte 0
   .byte 0
 .LDIEEnd:
@@ -220,12 +229,20 @@ personality:
   .uleb128 .Lcallend-.Lbegin
   .uleb128 1
   .byte 88
+  .byte 8
+  .quad .Ltail
+  .uleb128 .Lend-.Ltail
+  .uleb128 1
+  .byte 88
   .byte 0
 .Llocend:
 .else
 .section .debug_loc,"",@progbits
 .Lloc:
   .quad 0, .Lcallend-.Lbegin
+  .short 1
+  .byte 88
+  .quad .Ltail-.Lbegin, .Lend-.Lbegin
   .short 1
   .byte 88
   .quad 0, 0

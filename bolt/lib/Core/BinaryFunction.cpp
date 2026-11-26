@@ -3639,6 +3639,8 @@ void BinaryFunction::fixBranches(const BranchLivenessInfo *BLI) {
   auto &MIB = BC.MIB;
   MCContext *Ctx = BC.Ctx.get();
 
+  const bool KeepOffsets = opts::UpdateDebugSections && opts::DoNotUseStubs &&
+                           BC.isAArch64() && BC.isELF() && !isPatch();
   for (auto BBI = Layout.block_begin(), BBE = Layout.block_end(); BBI != BBE;
        ++BBI) {
     BinaryBasicBlock *BB = *BBI;
@@ -3649,9 +3651,21 @@ void BinaryFunction::fixBranches(const BranchLivenessInfo *BLI) {
     if (!BB->analyzeBranch(TBB, FBB, CondBranch, UncondBranch))
       continue;
 
-    // We will create unconditional branch with correct destination if needed.
-    if (UncondBranch)
+    auto rememberBranch = [&](const MCInst *Branch) {
+      if (KeepOffsets && Branch)
+        if (auto Offset = MIB->getOffset(*Branch))
+          BB->getOrCreateTranslation().BranchOffset = *Offset;
+    };
+    auto addBranch = [&](const BinaryBasicBlock *Target) {
+      BB->addBranchInstruction(Target);
+      if (KeepOffsets && BB->Translation &&
+          BB->Translation->BranchOffset != BinaryBasicBlock::INVALID_OFFSET)
+        MIB->setOffset(BB->back(), BB->Translation->BranchOffset);
+    };
+    if (UncondBranch) {
+      rememberBranch(UncondBranch);
       BB->eraseInstruction(BB->findInstruction(UncondBranch));
+    }
 
     // Basic block that follows the current one in the final layout.
     const BinaryBasicBlock *const NextBB =
@@ -3662,11 +3676,14 @@ void BinaryFunction::fixBranches(const BranchLivenessInfo *BLI) {
       // falls-through into the next function - hence the block will have only
       // one valid successor. Since behaviour is undefined - we replace
       // the conditional branch with an unconditional if required.
-      if (CondBranch)
+      if (CondBranch) {
+        if (!UncondBranch)
+          rememberBranch(CondBranch);
         BB->eraseInstruction(BB->findInstruction(CondBranch));
+      }
       if (BB->getSuccessor() == NextBB)
         continue;
-      BB->addBranchInstruction(BB->getSuccessor());
+      addBranch(BB->getSuccessor());
     } else if (BB->succ_size() == 2) {
       assert(CondBranch && "conditional branch expected");
       const BinaryBasicBlock *TSuccessor = BB->getConditionalSuccessor(true);
@@ -3684,9 +3701,11 @@ void BinaryFunction::fixBranches(const BranchLivenessInfo *BLI) {
           continue;
         }
 
+        if (!UncondBranch)
+          rememberBranch(CondBranch);
         BB->removeDuplicateConditionalSuccessor(CondBranch);
         if (TSuccessor != NextBB)
-          BB->addBranchInstruction(TSuccessor);
+          addBranch(TSuccessor);
         continue;
       }
 
@@ -3738,7 +3757,7 @@ void BinaryFunction::fixBranches(const BranchLivenessInfo *BLI) {
           swapSuccessors();
       }
 
-      BB->addBranchInstruction(FSuccessor);
+      addBranch(FSuccessor);
     }
     // Cases where the number of successors is 0 (block ends with a
     // terminator) or more than 2 (switch table) don't require branch
@@ -4732,14 +4751,14 @@ BinaryFunction::translateInputToOutputRange(DebugAddressRange InRange) const {
                 getAddress() + BB.getOffset() + Offset))
           return *OutAddr;
       const uint64_t OutAddress = BB.getOutputAddressRange().first + Offset;
-      return std::min(OutAddress, BB.getOutputAddressRange().second);
+      return std::min(OutAddress, BB.getDebugEndAddress());
     };
 
     uint64_t OutLowPC = BB.getOutputAddressRange().first;
     if (InputOffset > BB.getOffset())
       OutLowPC = translateBlockOffset(InputOffset - BB.getOffset());
 
-    uint64_t OutHighPC = BB.getOutputAddressRange().second;
+    uint64_t OutHighPC = BB.getDebugEndAddress();
     if (InputEndOffset < BB.getEndOffset()) {
       assert(InputEndOffset >= BB.getOffset());
       OutHighPC = translateBlockOffset(InputEndOffset - BB.getOffset());

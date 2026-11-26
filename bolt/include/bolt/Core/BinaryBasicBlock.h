@@ -98,7 +98,20 @@ private:
   /// symbol. Enables writing BOLT address translation tables used for mapping
   /// control transfer in the output binary back to the original binary.
   using LocSymsTy = std::vector<std::pair<uint32_t, const MCSymbol *>>;
-  std::unique_ptr<LocSymsTy> LocSyms;
+  struct AddressTranslation {
+    LocSymsTy LocSyms;
+    // Keep the input branch offset even while the edge is a fall-through.
+    uint32_t BranchOffset = INVALID_OFFSET;
+    // End of source code relative to the emitted block label.
+    uint32_t DebugSize = INVALID_OFFSET;
+  };
+  std::unique_ptr<AddressTranslation> Translation;
+
+  AddressTranslation &getOrCreateTranslation() {
+    if (!Translation)
+      Translation = std::make_unique<AddressTranslation>();
+    return *Translation;
+  }
 
   /// Alignment requirements for the block.
   uint32_t Alignment{1};
@@ -821,12 +834,22 @@ public:
   uint64_t getOutputStartAddress() const { return OutputAddressRange.first; }
   uint64_t getOutputEndAddress() const { return OutputAddressRange.second; }
 
-  bool hasLocSyms() const { return LocSyms != nullptr; }
+  void setDebugSize(uint32_t Size) {
+    getOrCreateTranslation().DebugSize = Size;
+  }
+
+  uint64_t getDebugEndAddress() const {
+    if (Translation && Translation->DebugSize != INVALID_OFFSET)
+      return getOutputStartAddress() + Translation->DebugSize;
+    return getOutputEndAddress();
+  }
+
+  bool hasLocSyms() const {
+    return Translation && !Translation->LocSyms.empty();
+  }
 
   /// Return mapping of input offsets to symbols in the output.
-  LocSymsTy &getLocSyms() {
-    return LocSyms ? *LocSyms : *(LocSyms = std::make_unique<LocSymsTy>());
-  }
+  LocSymsTy &getLocSyms() { return getOrCreateTranslation().LocSyms; }
 
   /// Return mapping of input offsets to symbols in the output.
   const LocSymsTy &getLocSyms() const {
